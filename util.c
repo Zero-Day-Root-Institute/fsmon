@@ -1,6 +1,7 @@
-/* fsmon -- MIT - Copyright NowSecure 2015-2025 - pancake@nowsecure.com */
+/* fsmod -- MIT - Copyright NowSecure 2015-2025 - pancake@nowsecure.com */
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -16,7 +17,7 @@
 #include <linux/limits.h>
 #endif
 #include <errno.h>
-#include "fsmon.h"
+#include "fsmod.h"
 
 void hexdump(const uint8_t *buf, unsigned int len, int w) {
 	size_t i, j;
@@ -54,6 +55,7 @@ const char *fm_typestr(int type) {
 		__ (FSE_FINDER_INFO_CHANGED),
 		__ (FSE_XATTR_MODIFIED),
 		__ (FSE_XATTR_REMOVED),
+		__ (FSE_CLONE),
 	};
 	switch (type) {
 	case FSE_ARG_DONE: return "FSE_ARG_DONE";
@@ -86,29 +88,30 @@ const char *fm_argstr(int type) {
 	case FSE_ARG_DONE: return "FSE_ARG_DONE";
 	case 0: return "FSE_UNKNOWN";
 	}
-	return (type >= 0 && type < FSE_MAX_EVENTS && args[type])? args[type]: "";
+	return (type >= 0 && (size_t)type < sizeof(args) / sizeof(args[0]) && args[type])? args[type]: "";
 }
 
 const char *fm_colorstr(int type) {
 	const char *colors[FSE_MAX_EVENTS] = {
-		Color_MAGENTA,// FSE_CREATE_FILE
-		Color_RED,    // FSE_DELETE
-		Color_YELLOW, // FSE_STAT_CHANGED
-		Color_GREEN,  // FSE_RENAME
-		Color_YELLOW, // FSE_CONTENT_MODIFIED
-		Color_BLUE,   // FSE_CREATE_DIR
-		Color_YELLOW, // FSE_CHOWN
-		Color_GREEN,  // FSE_EXCHANGE
-		Color_YELLOW, // FSE_FINDER_INFO_CHANGED
-		Color_YELLOW, // FSE_XATTR_MODIFIED,
-		Color_RED,    // FSE_XATTR_REMOVED,
+		[FSE_CREATE_FILE] = Color_MAGENTA,
+		[FSE_DELETE] = Color_RED,
+		[FSE_STAT_CHANGED] = Color_YELLOW,
+		[FSE_RENAME] = Color_GREEN,
+		[FSE_CONTENT_MODIFIED] = Color_YELLOW,
+		[FSE_CREATE_DIR] = Color_BLUE,
+		[FSE_CHOWN] = Color_YELLOW,
+		[FSE_EXCHANGE] = Color_GREEN,
+		[FSE_FINDER_INFO_CHANGED] = Color_YELLOW,
+		[FSE_XATTR_MODIFIED] = Color_YELLOW,
+		[FSE_XATTR_REMOVED] = Color_RED,
+		[FSE_CLONE] = Color_GREEN,
 	};
 	switch (type) {
 	case FSE_ARG_DONE: return Color_GREEN;
 	case FSE_OPEN: return Color_GREEN;
 	case FSE_UNKNOWN: return Color_RED;
 	}
-	return (type >= 0 && type < FSE_MAX_EVENTS)? colors[type]: "";
+	return (type >= 0 && type < FSE_MAX_EVENTS && colors[type])? colors[type]: "";
 }
 
 const char *get_proc_name(int pid, int *ppid) {
@@ -125,8 +128,9 @@ const char *get_proc_name(int pid, int *ppid) {
 
 	memset (path, 0, sizeof (path));
 	if ((rc = sysctl (mib, 4, path, &len, NULL, 0)) != 0) {
-		perror("trace facility failure, KERN_PROC_PID\n");
-		exit (1);
+		/* The process may have exited before its metadata was read. */
+		if (ppid) *ppid = 0;
+		return NULL;
 	}
 
 	if (ppid) *ppid = kinfo->kp_eproc.e_ppid;
@@ -138,6 +142,10 @@ const char *get_proc_name(int pid, int *ppid) {
 	fd = open (path, O_RDONLY);
 	if (fd == -1) {
 		// eprintf ("Cannot open '%s'\n", path);
+		return NULL;
+	}
+	if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1) {
+		close (fd);
 		return NULL;
 	}
 	path[0] = 0;
@@ -186,12 +194,21 @@ bool copy_file(const char *src, const char *dst) {
 		perror ("open");
 		return false;
 	}
+	if (fcntl (fd_src, F_SETFD, FD_CLOEXEC) == -1) {
+		close (fd_src);
+		return false;
+	}
 	if (!fstat (fd_src, &stat_src)) {
 		mode = stat_src.st_mode;
 	}
 	fd_dst = open (dst, O_RDWR | O_CREAT | O_TRUNC, mode);
 	if (fd_dst == -1) {
 		(void) close (fd_src);
+		return false;
+	}
+	if (fcntl (fd_dst, F_SETFD, FD_CLOEXEC) == -1) {
+		close (fd_src);
+		close (fd_dst);
 		return false;
 	}
 	for (;;) {
@@ -206,21 +223,35 @@ bool copy_file(const char *src, const char *dst) {
 	return true;
 }
 
-static bool isPrintable(const char ch) {
-	if (ch == '"' || ch == '\\') {
-		return false;
-	}
-	return IS_PRINTABLE (ch);
-}
-
 char *fmu_jsonfilter(const char *s) {
-	char *r, *R = strdup (s);
-	for (r = R; *r; ) {
-		if (isPrintable (*r)) {
-			r++;
-		} else {
-			memmove (r, r + 1, strlen (r) + 1);
+	static const char hex[] = "0123456789abcdef";
+	if (!s) s = "";
+	size_t len = strlen (s);
+	if (len > (SIZE_MAX - 1) / 6) return NULL;
+	char *result = malloc (len * 6 + 1);
+	if (!result) return NULL;
+	char *out = result;
+	const unsigned char *p = (const unsigned char *)s;
+	for (; *p; p++) {
+		unsigned char c = *p;
+		switch (c) {
+		case '"': *out++ = '\\'; *out++ = '"'; break;
+		case '\\': *out++ = '\\'; *out++ = '\\'; break;
+		case '\b': *out++ = '\\'; *out++ = 'b'; break;
+		case '\f': *out++ = '\\'; *out++ = 'f'; break;
+		case '\n': *out++ = '\\'; *out++ = 'n'; break;
+		case '\r': *out++ = '\\'; *out++ = 'r'; break;
+		case '\t': *out++ = '\\'; *out++ = 't'; break;
+		default:
+			if (c < 0x20) {
+				*out++ = '\\'; *out++ = 'u';
+				*out++ = '0'; *out++ = '0';
+				*out++ = hex[c >> 4]; *out++ = hex[c & 15];
+			} else {
+				*out++ = c;
+			}
 		}
 	}
-	return R;
+	*out = 0;
+	return result;
 }

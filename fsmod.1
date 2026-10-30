@@ -1,0 +1,504 @@
+.Dd October 28, 2026
+.Dt FSMOD 1
+.Sh NAME
+.Nm fsmod
+.Nd FileSystem events Monitor
+.Sh SYNOPSIS
+.Nm fsmod
+.Op Fl chfjLv
+.Op [-a sec]
+.Op [-b dir]
+.Op [-p pid]
+.Op [-P proc]
+.Nm fsmod
+.Op Fl C Ar config
+.Op Fl F | D
+.Op Fl S | T
+.Nm fsmod
+.Op Fl C Ar config
+.Cm ctl status
+.Op Fl -json
+.Op Fl -socket Ar path
+.Nm fsmod
+.Op Fl C Ar config
+.Cm ctl pause
+.Fl -id Ar owner
+.Op Fl -scope Ar all|report
+.Op Fl -ttl Ar seconds
+.Op Fl -discard-pending
+.Op Fl -socket Ar path
+.Nm fsmod
+.Op Fl C Ar config
+.Cm ctl resume
+.Fl -id Ar owner
+.Op Fl -socket Ar path
+.Nm fsmod
+.Op Fl C Ar config
+.Cm ctl run
+.Op Fl -scope Ar all|report
+.Op Fl -ttl Ar seconds
+.Op Fl -discard-pending
+.Op Fl -socket Ar path
+.Cm --
+.Ar command
+.Op Ar arguments ...
+.Sh DESCRIPTION
+This utility wait for events happening in a specific filesystem directory, it allows to filter by pid, path and even create a backup of the modified files.
+.Pp
+With no arguments, start the configured reporting service in the foreground.
+The default configuration is /etc/fsmod.conf on Rootful iOS and desktop hosts,
+or the matching jailbreak-prefix etc/fsmod.conf on Rootless iOS.
+The iOS executable is installed as /usr/sbin/fsmod (Rootful) or
+/var/jb/usr/sbin/fsmod (Rootless). No usr/bin/fsmod compatibility entry is installed.
+No -C or -F argument is needed in launchd ProgramArguments.
+The -D, -F, -S and -T options also use the default configuration when -C is absent.
+.Sh OPTIONS
+.Bl -tag -width Fl
+.It Fl C Ar config
+load daemon and HTTP-reporting configuration; report_url and at least one
+absolute watch_path are required
+.It Fl D
+run the configured service in the background, returning after initialization
+.It Fl F
+run the configured service in the foreground for launchd or systemd
+.It Fl S
+send SIGTERM to the instance identified by the configured locked PID file;
+the command returns before the queue finishes draining
+.It Fl T
+validate configuration without starting monitoring or sending requests
+.It Fl a Ar sec
+stop monitoring after some seconds
+.It Fl b Ar dir
+backup directory to store the backup
+.It Fl c
+follow children of -p pid
+.It Fl h
+show usage help message
+.It Fl j
+output in JSON
+.It Fl l
+.It Fl L
+List all the filesystem monitor backends available
+.It Fl f
+show filename only (no path)
+.It Fl p Ar pid
+grab events produced by this pid
+.It Fl P Ar proc
+grab events produced by this process name
+.It Fl v
+show version
+.El
+.Sh RUNTIME CONTROL
+The configured daemon accepts local control commands without stopping its
+backend or launchd/systemd service. Run commands as the daemon's user, which
+is root for the iOS packages. The endpoint is a private Unix-domain socket
+normally named by appending .ctl to the configured pid_file. With the packaged
+iOS configuration, both layouts use /var/run/fsmod.pid.ctl. If that name exceeds
+the platform's socket path limit, a deterministic /tmp/fsmod-<uid>-<path-hash>.ctl
+path is used instead. The state file always appends .ctl.state to pid_file.
+.Pp
+Without --socket, ctl loads the default configuration or the -C override to
+locate the configured instance. An explicit --socket bypasses configuration
+loading. It can therefore control an existing instance even if its saved
+configuration has since become invalid. Example:
+.Bd -literal -offset indent
+/usr/sbin/fsmod ctl status --json
+/usr/sbin/fsmod ctl pause --id com.example.package --scope all --ttl 600
+/usr/sbin/fsmod ctl resume --id com.example.package
+./fsmod -C ./fsmod.conf ctl status --json
+./fsmod ctl status --socket /tmp/fsmod.pid.ctl
+.Ed
+.Pp
+Rootless uses /var/jb/usr/sbin/fsmod with the same arguments. The control
+status, pause and resume commands return JSON; status accepts --json for
+explicit script usage. A zero exit status confirms success. Nonzero means the
+operation was not confirmed. The run command preserves child output instead.
+.Bl -tag -width "--discard-pending"
+.It Cm status
+Report ok, pid, monitor_paused, report_paused, queued, in_flight, delivered,
+failed, dropped, suppressed_monitor, suppressed_report and holds. Each hold
+contains id, scope and remaining_seconds. Counters apply to the current
+process lifetime.
+.It Cm pause Fl -id Ar owner
+Create or replace the named maintenance hold. Owners contain 1 to 127 ASCII
+letters, digits, dots, underscores or hyphens. At most 64 owners can hold a
+pause simultaneously. Repeating an owner replaces its scope and renews its
+expiration rather than creating an additional hold.
+.It Fl -scope Ar all|report
+The default all scope suppresses both HTTP reporting and log_events output.
+The report scope suppresses only HTTP; event logging still follows log_events.
+The backend continues reading the event stream in both cases. Events handled
+during a hold are discarded for its suppressed outputs, not queued for later
+delivery. An all hold takes precedence over report.
+.It Fl -ttl Ar seconds
+Hold expiration in whole seconds, from 1 through 86400; the default is 600.
+Renew before expiration for longer maintenance. Expiration is automatic and
+does not require a status query.
+.It Fl -discard-pending
+Also discard the reporter's preexisting pending queue. Otherwise queued
+reports, including an interrupted transfer when capacity permits, remain
+eligible after the last reporting hold ends. The queue is only in memory.
+Stopping while paused does not send retained reports.
+.It Cm resume Fl -id Ar owner
+Release only the named hold. Releasing an unknown owner succeeds without
+changing other holds. All applicable holds must end before the corresponding
+output resumes.
+.It Cm run Op Ar options Cm -- Ar command Op Ar arguments ...
+Create a unique hold, wait for the pause acknowledgement, execute the command
+with its arguments, wait for completion and release only this invocation's
+hold. Other owners remain active. The child inherits standard input, output
+and error; wrapper diagnostics use standard error without JSON on standard
+output. No shell expansion is performed.
+.Pp
+Foreground commands support interactive terminal input. Shell job control
+such as Ctrl-Z, fg and bg is not supported; avoid suspending the command
+during a maintenance hold.
+.Pp
+Options --scope, --ttl, --discard-pending and --socket must precede the required
+-- separator. A command is required after it. The default scope is all and TTL
+is 600 seconds. The wrapper generates its own owner; --id and --json are not
+accepted. All arguments after -- belong to the child, including --socket.
+.El
+.Pp
+For example, pause before an entire package installation begins:
+.Bd -literal -offset indent
+/usr/sbin/fsmod ctl run --scope all --ttl 600 -- dpkg -i yourpackage.deb
+/var/jb/usr/sbin/fsmod ctl run --scope all --ttl 600 -- dpkg -i yourpackage.deb
+./fsmod -C ./fsmod.conf ctl run --ttl 1800 -- command argument
+.Ed
+.Pp
+The command is not started when pausing fails or the daemon is unavailable.
+After a successful pause, run attempts cleanup on normal exit, launch failure
+and catchable SIGINT, SIGTERM or SIGHUP, forwarding these signals to the child
+process group. Its exit status is the child exit code or 128 plus its signal.
+An unavailable executable returns 127; other launch failures return 126. A
+cleanup error makes an otherwise successful command nonzero, but does not
+replace a nonzero child result. Descendants that detach or outlive the direct
+command are outside the wrapper's command lifetime.
+.Pp
+The run TTL is a fixed safety cap and is not automatically renewed. Select a
+TTL longer than the expected command duration. If it expires, monitoring and
+reporting resume while the command continues. SIGKILL prevents cleanup; the
+hold then relies on expiration.
+.Pp
+A successful pause waits for the event-processing gate and for an active
+HTTP transfer to finish or cancel. Begin filesystem maintenance only after
+the command exits successfully. A timeout can leave the hold active; query
+status before retrying. A request already received by the server cannot be
+withdrawn, even if its response is interrupted. Control is not a filesystem
+transaction.
+.Pp
+For devfsev, kernel timestamps suppress delayed events from before a resume
+boundary. Backends without those timestamps apply holds at callback processing
+time; events delayed within the backend until after resume can still appear.
+Unexpired holds are restored before event processing after a daemon restart
+on the same boot. A reboot invalidates the previous boot's holds. Preserve the
+private state file while a hold is active; events and counters are not persisted.
+.Pp
+The socket verifies the peer's user ID and opens no network port. Control does
+not reload the static configuration. Service lifecycle and control messages
+remain logged while event logging is suppressed. In deb maintainer scripts,
+pause before changing files and resume afterwards, using the package ID as
+owner. Also release on failure paths when possible; the TTL is a fallback.
+Use ctl run around the whole package-manager command to cover changes before
+a package's maintainer scripts are invoked.
+Do not use -S for a maintenance hold because launchd KeepAlive can restart it.
+.Sh CONFIGURATION
+.Pp
+The configuration uses unquoted key=value lines. Repeat watch_path and
+exclude_path for multiple absolute paths. Unknown or duplicate scalar keys
+are rejected. See fsmod.conf.example and README.md for all settings.
+.Pp
+At least one watch_path entry is required; the limit of 64 counts configured
+entries, including skipped paths. A watch_path that cannot be resolved with
+ENOENT or ENOTDIR produces a warning and is skipped; other path errors remain
+fatal. Existing roots are normalized with realpath. Nested watches are allowed;
+duplicate canonical watch paths are rejected. Collection uses the outermost
+nonoverlapping roots while retaining all logical watch rules. Linux fanotify
+keeps every explicit root so nested mount points are also marked.
+Each exclude_path must exist at startup.
+.Pp
+The most specific matching watch_path or exclude_path wins for each path,
+regardless of configuration order. Rules match whole path components. A deeper
+watch restores monitoring inside a parent exclusion; a deeper exclusion can
+exclude part of that watch again. At the same path, exclusion wins. Example:
+.Bd -literal -offset indent
+watch_path=/Library
+watch_path=/Library/dpkg/info
+exclude_path=/Library/dpkg
+.Ed
+.Pp
+This monitors /Library, excludes /Library/dpkg, and restores /Library/dpkg/info
+and its descendants. Startup and -T reject a configuration when every effective
+watch is still excluded; a restored deeper watch counts as monitored scope.
+.Pp
+If all watch paths are skipped, the service starts idle with roots=0. The -T
+check also succeeds with warnings when the rest of the configuration is valid.
+A skipped path is not automatically added if created later; restart to watch it.
+.Pp
+An optional watch_events selects events for the most recent watch_path, at most
+once per path. Comments and other settings do not change that association. Each
+new watch_path defaults to all, including nested watches. The most specific
+matching watch supplies the event selection; selections are not inherited or
+combined with parent selections. Example pairs, commented out:
+.Bd -literal -offset indent
+# watch_path=/private/etc
+# watch_events=create,modify
+# watch_path=/bin
+# watch_events=all
+# watch_path=/sbin
+# watch_events=create,FSE_CONTENT_MODIFIED
+.Ed
+.Pp
+The case-sensitive groups are create (FSE_CREATE_FILE, FSE_CREATE_DIR), modify
+(FSE_CONTENT_MODIFIED, FSE_STAT_CHANGED, FSE_CHOWN, FSE_XATTR_MODIFIED,
+FSE_XATTR_REMOVED, FSE_FINDER_INFO_CHANGED), delete (FSE_DELETE), rename
+(FSE_RENAME), clone (FSE_CLONE), and exchange (FSE_EXCHANGE). Comma-separated
+groups can be mixed with exact event names. The all token must be used alone.
+.Pp
+Exact names include all types in the groups above, plus FSE_DOCID_CREATED,
+FSE_DOCID_CHANGED, FSE_UNMOUNT_PENDING, FSE_OPEN, FSE_CLOSE,
+FSE_CLOSE_WRITABLE, and FSE_UNKNOWN. Repeated tokens are harmless; unknown
+tokens, empty items, all mixed with other tokens, a missing preceding watch_path,
+or a second watch_events for the same path are errors. Rules for skipped paths
+are still validated and do not change any preceding effective root's rule.
+.Pp
+For rename and clone events, each path is resolved independently using the most
+specific rule. A final exclusion on either side omits the whole event; a path
+outside all rules is not excluded. Otherwise, at least one included path's most
+specific watch must allow the event type. Event selection filters
+HTTP reporting and log_events, not kernel subscriptions. The all setting only
+accepts events the backend provides; it cannot add read tracking or recover the
+source of a libc read/write copy. Restart to apply changed rules.
+.Pp
+Repeat exclude_process to exclude exact, case-sensitive event process names,
+for example exclude_process=zsh and exclude_process=sshd on separate lines.
+Duplicate names are deduplicated; no process names are excluded by default.
+Match the reported data.proc value, not a PID, full executable path, wildcard,
+or substring. The rule does not automatically exclude descendant processes.
+Kernel collection continues, but matching events are discarded before both
+HTTP queueing and log_events output. Restart to apply changed rules.
+.Pp
+The setting is accepted with every backend. devfsev and fanotify usually provide
+originating process names, while fsevapi and inotify may not. A process name may
+also be unavailable after process exit or truncated by the OS. Use the actual
+data.proc value; events without a process name remain eligible under the other
+filters.
+.Pp
+Repeat watch_uid to accept only selected event UIDs, or exclude_uid to omit
+selected event UIDs. Each line accepts one decimal value from 0 to 4294967295,
+not a user name, PID, device UUID, comma-separated list, sign or wildcard.
+Example rules, disabled unless uncommented:
+.Bd -literal -offset indent
+# watch_uid=0
+# watch_uid=501
+# exclude_uid=501
+.Ed
+.Pp
+These keys match the backend-supplied data.uid value. With devfsev, the
+FSE_ARG_UID/file-info metadata supplies the file owner's UID, not necessarily
+the UID of the process performing the operation. Other current backends do not
+supply a usable event UID. fsmod does not infer it using its own getuid(), a
+later stat(), or process credentials. A zero in JSON alone may also mean
+unavailable metadata and does not establish root ownership or a root process.
+.Pp
+With neither key, UID metadata imposes no restriction. Once any UID rule is
+configured, unavailable UIDs are rejected. A nonempty watch_uid list accepts
+only listed UIDs. With only exclude_uid, all known UIDs except those listed
+remain eligible. exclude_uid takes precedence over watch_uid; the example
+above, if all three lines are enabled, accepts only UID 0. Duplicate values
+are deduplicated, with no fixed entry count limit apart from available memory.
+.Pp
+UID rules are global and combine with path, event-type and process rules; an
+event must pass every filter. They apply before both HTTP queueing and
+log_events output, while kernel collection continues. Restart after changes.
+The report JSON schema is unchanged.
+.Pp
+Repeat watch_gid to accept only selected event GIDs, or exclude_gid to omit
+selected event GIDs. Each line accepts one decimal value from 0 to 4294967295.
+These keys match the backend-supplied data.gid value. With devfsev, this is the
+file owner's group GID from event metadata, not the operation process GID or
+its supplementary groups. Current other backends do not supply a usable event
+GID.
+.Pp
+With neither key, GID metadata imposes no restriction. Once any GID rule is
+configured, unavailable GIDs are rejected. A nonempty watch_gid list accepts
+only listed GIDs. With only exclude_gid, all known GIDs except those listed
+remain eligible. exclude_gid takes precedence over watch_gid. Duplicate values
+are deduplicated, with no fixed entry count limit apart from available memory.
+.Pp
+UID and GID rule groups combine with AND semantics and with path, event-type
+and process rules; an event must pass every group. They are not paired by line
+and do not form an OR across groups. GID rules apply before HTTP queueing and
+log_events output, while kernel collection continues. Restart after changes.
+The report JSON schema is unchanged.
+.Pp
+Repeat watch_ppid to accept only selected direct parent process IDs, or
+exclude_ppid to omit them. Each line accepts one decimal value from 1 to
+2147483647; signs, names, comma-separated lists and wildcards are invalid.
+Repeat either key for multiple values. Duplicates are deduplicated, with no
+fixed entry count limit apart from available memory. With neither key, PPID
+imposes no restriction. A nonempty watch_ppid list is an allowlist;
+exclude_ppid takes precedence. Once any PPID rule is configured, unavailable
+or nonpositive PPIDs are rejected.
+.Pp
+These rules match data.ppid: the operation process's direct parent PID
+resolved when fsmod consumes the event. Apple devfsev and Linux fanotify
+attempt resolution; daemon backends fsevapi and inotify have no PPID
+information. This is not a parent name, ancestor, file UID/GID, or stable
+process identity. Process exit and PID reuse can affect the result.
+For example, watch_ppid=1 selects resolved direct parents with PID 1, not
+every descendant of PID 1.
+.Pp
+PPID rules combine with UID, GID, path, event-type and process rules using
+AND: every filter must pass. They apply before HTTP queueing and log_events,
+while kernel collection continues. Restart after changes.
+.Pp
+The default daemon backend is fsevapi on macOS, devfsev on iOS, and inotify on Linux.
+On iOS the configured service stays in the foreground under launchd; background fork is not supported.
+daemonize defaults to true on desktop and false on iOS. Protect configurations
+containing report_token with mode 0600. Desktop HTTP reporting links libcurl
+7.32.0 or newer with asynchronous DNS support; no curl executable is required.
+A reporter startup error is returned when asynchronous DNS is unavailable.
+iOS HTTP reporting uses the system CFNetwork framework. Rootful and Rootless
+packages differ in installation paths and require access to /dev/fsevents.
+WatchOS and default Android builds provide interactive monitoring without
+HTTP reporting. Android reporting requires an explicit target-libcurl build;
+see README.md for the cross-compilation options.
+.Pp
+Events are JSON POST requests. Only HTTP 200 responses succeed; all other
+statuses, including 201 and 204, fail and use the configured retries. Response
+bodies are discarded, including nonempty bodies on successful responses.
+The worker reuses libcurl handles and eligible HTTP connections. The bounded
+queue retries failures but has no persistent spool; overflow or shutdown
+timeout can discard events. On SIGTERM and SIGINT, shutdown_timeout_seconds is
+the queue drain/cancellation target, not an absolute process exit deadline.
+At that deadline the reporter cancels the active transfer and discards queued
+events. Older libcurl versions can wait for threaded system DNS during cleanup;
+resolver or TLS cleanup may extend shutdown. Supported build/runtime libcurl
+versions enable best-effort quick cancellation without an exact timing guarantee.
+Restart to apply configuration edits. Bearer tokens are
+sent from process memory without subprocesses or temporary token files.
+.Sh REPORT FORMAT
+.Pp
+Each POST body is one JSON object with two top-level fields: source is the
+fixed string fsmod identifying the reporting application, and data is a nested
+JSON object containing all host and event fields, not a JSON-encoded string.
+The device/installation identifier is data.uuid. No extra configuration is
+required. Receivers must read data.filename, data.uuid, data.type and the other
+nested fields instead of their former top-level locations.
+.Pp
+Configured log_events=true output uses the same envelope. Traditional
+interactive -j/-J output keeps its existing format. The HTTP endpoint, POST
+method, Content-Type and bearer authentication are unchanged. Only HTTP 200
+confirms delivery; other statuses use the existing retry configuration.
+.Pp
+The following values are illustrative, not values obtained from the current
+host; event metadata depends on the backend.
+.Bd -literal -offset indent
+{
+  "source": "fsmod",
+  "data": {
+    "hostname": "my-mac",
+    "uuid": "01234567-89AB-CDEF-0123-456789ABCDEF",
+    "os_name": "macOS",
+    "os_version": "15.0",
+    "kernel_version": "24.0.0",
+    "backend": "fsevapi",
+    "observed_at": "2026-10-26T08:00:00.123Z",
+    "type": "FSE_CONTENT_MODIFIED",
+    "filename": "/private/tmp/example.txt",
+    "newfile": null,
+    "proc": null,
+    "event": null,
+    "pid": 0,
+    "ppid": 0,
+    "uid": 0,
+    "gid": 0,
+    "inode": 0,
+    "mode": 0,
+    "dev_major": 0,
+    "dev_minor": 0,
+    "kernel_timestamp": 0
+  }
+}
+.Ed
+.Pp
+The host fields below are JSON strings inside data, or null if unavailable.
+Per-event process and file metadata is also inside data.
+.Bl -tag -width data.kernel_version
+.It data.uuid
+Host or OS-installation identifier, separate from numeric data.uid, which
+remains the event's UNIX user ID. On macOS, gethostuuid() supplies the host UUID,
+formatted in uppercase with hyphens. On Linux, the source is /etc/machine-id,
+falling back to /var/lib/dbus/machine-id; it is 32 lowercase hexadecimal
+characters. On iOS, the native MobileGestalt API supplies UniqueDeviceID, the
+device UDID. This may be 25 or 40 characters and is not necessarily an RFC 4122
+UUID. A failed read leaves data.uuid null; no random UUID or hostname is used
+as a substitute.
+.It data.os_name
+iOS on iOS; macOS on macOS. On Linux, NAME from /etc/os-release, falling back to
+/usr/lib/os-release; uname's system name may be used when release metadata is
+unavailable.
+.It data.os_version
+The iOS/macOS product version from kern.osproductversion, with ProductVersion in
+/System/Library/CoreServices/SystemVersion.plist as a fallback on older systems.
+On Linux, VERSION_ID from the same os-release source as data.os_name.
+.It data.kernel_version
+The kernel release returned by uname. On macOS this is the Darwin release,
+separate from the macOS product version in data.os_version.
+.El
+.Pp
+The data.uuid field is a device/installation identifier, not a user ID or
+authentication token, and it does not guarantee a globally unique physical
+device. Linux
+machine IDs can be duplicated by image cloning and can change after an OS
+reinstallation or regeneration. Hardware replacement and virtual-machine
+cloning can also affect host identity. A hostname change does not make fsmod
+generate a new identifier.
+.Pp
+Host metadata is collected and cached once per process when the first reporter
+starts, before monitoring begins. Events reuse that cache without running a
+shell command or rereading metadata files. Restart after an OS upgrade or
+identity change to refresh it; missing values remain null for that process
+lifetime. On iOS, both Rootful and Rootless builds use the system
+/usr/lib/libMobileGestalt.dylib without launching a subprocess. The signed
+binary requests access to UniqueDeviceID through its MobileGestalt
+entitlement; actual access depends on the device and jailbreak. A failed
+lookup writes a service-log warning and leaves data.uuid null.
+.Pp
+For devfsev, data.kernel_timestamp is the raw 64-bit mach_absolute_time() tick
+value appended by the kernel as its final FSE_ARG_INT64 argument. It is not
+Unix time, seconds, or milliseconds. observed_at is the UTC serialization time.
+Backends without a kernel timestamp leave the field zero; fsmod does not
+substitute the current clock. data.inode retains the unsigned 64-bit inode
+number. Receivers must preserve integer precision when parsing these fields.
+.Pp
+devfsev reports filesystem changes, not every file read or a complete record
+of a program's copy commands. An ordinary byte copy may report only destination
+creation, content and metadata changes with data.newfile null. Source reads
+do not supply a source-to-destination relationship. fsmod does not infer one
+from process IDs, event times or file contents. For a kernel event carrying
+two paths, data.filename is the first path and data.newfile is the second;
+a rename uses the old and new paths.
+.Pp
+The backend also subscribes to FSE_CLONE (event type 14). A native clone event
+uses data.filename for the source and data.newfile for the destination. This
+preserves an explicit kernel copy relationship; ordinary byte-copy operations
+still do not provide a source path.
+.Pp
+A zero data.uid or other zero-valued event field may indicate unavailable
+backend metadata, rather than an event from a root process.
+.Sh USAGE
+.Pp
+$ sudo fsmod -a 10 -j | json_pp
+.Pp
+.Sh AUTHORS
+.Pp
+Written by Sergi Alvarez <pancake@nowsecure.com>
+.Pp
+Developed at NowSecure '2015
+.Pp
+.Sh LICENSE
+.Pp
+This software is under the MIT license.
