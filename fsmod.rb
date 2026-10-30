@@ -1,4 +1,5 @@
-class Fsmon < Formula
+class Fsmod < Formula
+  # Compatibility recipe for the upstream release, not this checkout's daemon.
   desc "File-system monitor supporting inotify, fanotify, kqueue, fsevents"
   homepage "https://github.com/nowsecure/fsmon"
   head "https://github.com/nowsecure/fsmon.git", branch: "master"
@@ -8,12 +9,11 @@ class Fsmon < Formula
 
   def install
     system "make"
-    system "cp -f fsmon-macos fsmon"
-    bin.install "fsmon"
-    man1.install "fsmon.1"
+    bin.install "fsmon-macos" => "fsmod"
+    man1.install "fsmon.1" => "fsmod.1"
   end
 
   test do
-    assert_match "Usage:", shell_output("#{bin}/fsmon -h")
+    assert_match "Usage:", shell_output("#{bin}/fsmod -h")
   end
 end

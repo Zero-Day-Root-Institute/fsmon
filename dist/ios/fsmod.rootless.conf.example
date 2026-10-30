@@ -1,0 +1,163 @@
+# Rootless jailbreak: install as /var/jb/etc/fsmod.conf. Values are unquoted.
+# OpenResty destination supplied for this deployment.
+report_url=http://119.8.59.179:8085/events
+# report_token=replace-with-your-bearer-token
+
+# Repeat one absolute watch path per line; at most 64 configured entries.
+# Missing watch paths (ENOENT/ENOTDIR) warn and are skipped, including by -T.
+# Other path errors still fail; canonical nested watches are allowed, duplicates fail.
+# Most specific watch/exclude path wins; same-path exclude wins. Order is irrelevant.
+# Deeper watches restore scope inside exclusions; backend collection roots are merged.
+# Example: monitor /Library except dpkg, then restore dpkg/info:
+# watch_path=/Library
+# watch_path=/Library/dpkg/info
+# exclude_path=/Library/dpkg
+# All skipped: startup succeeds with warnings; roots=0 stays idle.
+# Restart after creating a skipped path; it is not added automatically.
+# Use the canonical /private/var path on iOS.
+# Optional watch_events applies once to the most recent watch_path, even across
+# comments/other settings. Each new watch_path defaults to all (no inheritance).
+# The most specific watch's events apply; parent/child selections are not combined.
+# Example pairs; leave commented unless adding/changing those watch roots:
+# watch_path=/private/etc
+# watch_events=create,modify
+# watch_path=/bin
+# watch_events=all
+# Groups: create,modify,delete,rename,clone,exchange; mix exact FSE_* names too.
+# Example: watch_events=create,FSE_CONTENT_MODIFIED
+# create = FSE_CREATE_FILE + FSE_CREATE_DIR; modify = FSE_CONTENT_MODIFIED,
+# FSE_STAT_CHANGED, FSE_CHOWN, FSE_XATTR_MODIFIED, FSE_XATTR_REMOVED,
+# FSE_FINDER_INFO_CHANGED. Other groups map to their corresponding FSE_* type.
+# Names are case-sensitive; all must stand alone. Unknown/empty items, duplicate
+# watch_events for a path, or no preceding watch_path are errors; repeated tokens are OK.
+# A skipped path's rule is still validated and never changes the previous root.
+# Filters HTTP + log_events, not kernel subscription. Resolve rename/clone sides
+# independently: any final exclusion drops the event; outside all rules is not excluded.
+# Otherwise at least one included side's most specific watch must allow the type.
+# all cannot enable missing backend events, reads, or libc copy-source tracking.
+# See README.md for all exact event names. Restart after configuration changes.
+watch_path=/Library
+watch_path=/System
+watch_path=/bin
+watch_path=/boot
+watch_path=/cores
+watch_path=/dev
+watch_path=/lib
+watch_path=/mnt
+watch_path=/sbin
+watch_path=/taurine
+watch_path=/usr
+watch_path=/private
+watch_path=/Library/dpkg/info
+
+
+
+
+# watch_path=/private/var/containers/Bundle/Application
+
+# Repeat exclude_path for every directory or file you want to ignore.
+# A directory excludes its subtree unless a deeper watch restores it; not a comma list.
+# Uncomment only paths that exist on this device.
+# exclude_path=/private/var/mobile/Library/Caches
+# exclude_path=/private/var/mobile/Library/Logs
+# exclude_path=/private/var/mobile/Media/DCIM
+
+exclude_path=/private/var/containers
+exclude_path=/private/var/cache
+exclude_path=/private/var/log
+exclude_path=/private/var/logs
+exclude_path=/private/var/tmp
+exclude_path=/private/var/mobile
+exclude_path=/private/var/preferences/SystemConfiguration
+exclude_path=/private/var/db/analyticsd
+exclude_path=/private/var/db/diagnostics
+exclude_path=/private/var/db/gpsd
+exclude_path=/private/var/db/uuidtext
+exclude_path=/private/var/db/timed
+exclude_path=/private/var/db/fud
+exclude_path=/private/var/db/dhcpclient
+exclude_path=/private/var/db/timezone
+exclude_path=/private/var/db/spindump
+exclude_path=/private/var/db/systemstats
+exclude_path=/Library/Caches
+exclude_path=/var/root/Library
+exclude_path=/Library/dpkg
+exclude_path=/private/var/root/.bash_history
+
+
+
+# Optional: exact, case-sensitive names from data.proc, one per line.
+# Removes matching events from HTTP reporting and log_events output.
+# Kernel collection continues; children and unavailable names are not excluded.
+# No PID, full-path, substring, or wildcard matching. Restart after changes.
+# exclude_process=zsh
+# exclude_process=sshd
+exclude_process=SpringBoard
+exclude_process=wifid
+exclude_process=cfprefsd
+exclude_process=logd
+exclude_process=nehelper
+exclude_process=securityd
+exclude_process=sandyd
+exclude_process=CloudKeychainPro
+exclude_process=ReportCrash
+exclude_process=ReportMemoryExce
+exclude_process=powerd
+exclude_process=mobileassetd
+exclude_process=trustd
+exclude_process=awdd
+exclude_process=netcc
+exclude_process=iosService
+
+
+# Optional global UID filters: one decimal data.uid per line (0..4294967295).
+# Repeat either key; duplicate UIDs are deduplicated, with no fixed count limit.
+# No UID rules by default. watch_uid accepts only listed UIDs; exclude_uid wins.
+# With any UID rule, events with unavailable UID metadata are discarded.
+# devfsev supplies the file owner's UID, not necessarily the actor process UID.
+# Current other backends do not provide a usable event UID; JSON zero can be unknown.
+# Not usernames, PIDs, device UUIDs, comma-separated lists, signs or wildcards.
+# Must also pass path/event/process filters. Filters HTTP + log_events, not kernel collection.
+# Restart after changes. Examples: root=0 and mobile=501 on typical iOS systems.
+# watch_uid=0
+# watch_uid=501
+# exclude_uid=501
+watch_uid=0
+
+# Optional global GID filters: one decimal data.gid per line (0..4294967295).
+# Repeat either key; duplicate GIDs are deduplicated, with no fixed count limit.
+# No GID rules by default. watch_gid accepts only listed GIDs; exclude_gid wins.
+# With any GID rule, events with unavailable GID metadata are discarded.
+# devfsev supplies the file owner's group GID, not the actor process GID/groups.
+# Current other backends do not provide a usable event GID; JSON zero can be unknown.
+# UID and GID rules are both required (AND), plus path/event/process filters.
+# Filters HTTP reporting and log_events, not kernel collection. Restart after changes.
+# watch_gid=0
+# watch_gid=501
+# exclude_gid=501
+
+# Optional global PPID filters: one decimal data.ppid per line (1..2147483647).
+# Repeat either key; duplicates are deduplicated. No PPID rules by default.
+# watch_ppid accepts only listed parents; exclude_ppid takes precedence.
+# With any PPID rule, unavailable/zero/negative PPIDs are discarded.
+# Matches the operation process's direct parent PID resolved when consuming the event.
+# devfsev and Linux fanotify attempt resolution; fsevapi/inotify have no PPID data.
+# Not a parent name, ancestor, file UID/GID, or stable identity; exit/PID reuse can affect it.
+# Must also pass UID/GID/path/event/process rules. Filters HTTP + log_events;
+# kernel collection continues. Restart after changes. Values below are examples only.
+# watch_ppid=1
+# watch_ppid=1234
+# exclude_ppid=1234
+
+
+backend=devfsev
+# launchd supervises the foreground process; do not double-fork.
+daemonize=false
+pid_file=/var/run/fsmod.pid
+log_file=/var/mobile/Library/Logs/fsmod/fsmod.log
+log_events=false
+queue_capacity=1024
+report_timeout_seconds=10
+report_retries=3
+retry_delay_seconds=2
+shutdown_timeout_seconds=15

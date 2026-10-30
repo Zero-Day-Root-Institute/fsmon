@@ -19,10 +19,10 @@ all: root
 
 root:
 	cd ../.. ; $(DOCKCROSS) --image dockcross/linux-$(CROSSARCH) bash -c make
-	mkdir -p root/usr/bin
+	mkdir -p root/usr/sbin
 	mkdir -p root/usr/share/man/man1
-	cp -f ../../fsmon root/usr/bin
-	cp -f ../../fsmon.1 root/usr/share/man/man1/fsmon.1
+	cp -f ../../fsmod root/usr/sbin
+	cp -f ../../fsmod.1 root/usr/share/man/man1/fsmod.1
 
 purge: clean
 	rm -rf root

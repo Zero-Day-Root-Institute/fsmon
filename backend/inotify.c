@@ -1,446 +1,447 @@
-/* fsmon -- MIT - Copyright NowSecure 2016-2025 - pancake@nowsecure.com  */
+/* fsmod -- MIT - Copyright NowSecure 2016-2026 */
 
 #if __linux__
 
 #include <stdio.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <limits.h>
-#include <signal.h>
-#include <libgen.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <dirent.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/syscall.h>
-#include "fsmon.h"
+#include <poll.h>
+#include "fsmod.h"
 
-#define USE_LSOF 0
-
-/* INOTIFY */
-static int fd = -1;
-#define BUF_LEN (10 * (sizeof(struct inotify_event) + NAME_MAX + 1))
-
-static void fm_control_c(void) {
-	if (fd != -1) {
-		close (fd);
-		fd = -1;
-	}
-}
-
-/* inotify fallback */
-
-typedef struct PidPath {
-	int fd;
+typedef struct {
+	int wd;
 	char *path;
-} PidPath;
+} Watch;
 
-static int skipevents = 0;
-static int pidpathn = 0;
-static PidPath* pidpaths = NULL;
+typedef struct {
+	char *path;
+	bool directory;
+} Root;
 
-static void setPathForFd(int fd, const char *path) {
-	int last = pidpathn++;
-	PidPath* tmp = realloc (pidpaths, pidpathn * sizeof (PidPath));
-	if (tmp) {
-		tmp[last].fd = fd;
-		tmp[last].path = strdup (path);
-		pidpaths = tmp;
-		skipevents += 2;
+typedef struct PendingMove {
+	uint32_t cookie;
+	char *path;
+	bool directory;
+	uint64_t expires;
+	struct PendingMove *next;
+} PendingMove;
+
+static int fd = -1;
+static uint32_t watch_mask = IN_ALL_EVENTS;
+static Watch *watches;
+static size_t watch_count;
+static Root *roots;
+static size_t root_count;
+static PendingMove *moves;
+
+static bool path_under(const char *path, const char *root) {
+	size_t n = strlen (root);
+	return !strncmp (path, root, n) &&
+		(!path[n] || root[n - 1] == '/' || path[n] == '/');
+}
+
+static uint64_t now_ms(void) {
+	struct timespec ts;
+	clock_gettime (CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static const char *watch_path(int wd) {
+	size_t i;
+	for (i = 0; i < watch_count; i++) {
+		if (watches[i].wd == wd) {
+			return watches[i].path;
+		}
+	}
+	return NULL;
+}
+
+static void remove_watch(int wd) {
+	size_t i;
+	for (i = 0; i < watch_count; i++) {
+		if (watches[i].wd == wd) {
+			free (watches[i].path);
+			watches[i] = watches[--watch_count];
+			return;
+		}
 	}
 }
 
-static bool invalidPathForFd(int fd) {
-	int i;
-	if (fd == -1) {
+static bool add_watch(const char *path) {
+	int wd = inotify_add_watch (fd, path, watch_mask | IN_ONLYDIR | IN_DONT_FOLLOW);
+	if (wd < 0) {
+		eprintf ("Cannot watch %s: %s\n", path, strerror (errno));
 		return false;
 	}
-	for (i = 0; i < pidpathn; i++) {
-		PidPath *pp = &pidpaths[i];
-		if (pp->fd == fd) {
-			close (pp->fd);
-			pp->fd = -1;
-			free (pp->path);
-			pp->path = NULL;
+	if (watch_path (wd)) {
+		return true;
+	}
+	char *copy = strdup (path);
+	Watch *tmp = copy? realloc (watches, (watch_count + 1) * sizeof (*watches)): NULL;
+	if (!tmp) {
+		free (copy);
+		inotify_rm_watch (fd, wd);
+		eprintf ("Cannot allocate inotify watch\n");
+		return false;
+	}
+	watches = tmp;
+	watches[watch_count].wd = wd;
+	watches[watch_count++].path = copy;
+	return true;
+}
+
+static bool add_tree(const char *path) {
+	if (!add_watch (path)) {
+		return false;
+	}
+	DIR *dir = opendir (path);
+	if (!dir) {
+		eprintf ("Cannot scan monitor directory %s: %s\n", path, strerror (errno));
+		return false;
+	}
+	bool complete = true;
+	struct dirent *entry;
+	for (;;) {
+		errno = 0;
+		entry = readdir (dir);
+		if (!entry) {
+			if (errno) {
+				eprintf ("Cannot read monitor directory %s: %s\n", path, strerror (errno));
+				complete = false;
+			}
+			break;
+		}
+		if (!strcmp (entry->d_name, ".") || !strcmp (entry->d_name, "..")) {
+			continue;
+		}
+		char child[PATH_MAX];
+		int n = snprintf (child, sizeof (child), "%s%s%s", path,
+			strcmp (path, "/")? "/": "", entry->d_name);
+		struct stat st;
+		if (n < 0 || (size_t)n >= sizeof (child)) {
+			eprintf ("Monitor directory path exceeds PATH_MAX under %s\n", path);
+			complete = false;
+		} else if (lstat (child, &st)) {
+			if (errno != ENOENT) {
+				eprintf ("Cannot inspect monitor path %s: %s\n", child, strerror (errno));
+				complete = false;
+			}
+		} else if (S_ISDIR (st.st_mode) && !add_tree (child)) {
+			complete = false;
+		}
+	}
+	closedir (dir);
+	return complete;
+}
+
+static bool in_directory_root(const char *path) {
+	size_t i;
+	for (i = 0; i < root_count; i++) {
+		if (roots[i].directory && path_under (path, roots[i].path)) {
 			return true;
 		}
 	}
 	return false;
 }
 
-static const char *getPathForFd(int fd) {
-	size_t i;
-	if (fd == -1) {
-		return false;
-	}
-	for (i = 0; i < pidpathn; i++) {
-		PidPath *pp = &pidpaths[i];
-		if (pp->fd == fd) {
-			return pp->path;
-		}
-	}
-	return "";
-}
-
-static void freePathForFd(void) {
-	size_t i;
-	for (i = 0; i < pidpathn; i++) {
-		PidPath *pp = &pidpaths[i];
-		free (pp->path);
-	}
-	free (pidpaths);
-	pidpaths = NULL;
-	pidpathn = 0;
-}
-
-#if USE_LSOF
-/* this is very slow, better not to enable it */
-static void lsof(const char *filename) {
-	DIR *d = opendir ("/proc");
-	if (!d) {
-		return;
-	}
-	struct dirent *entry, *entry2;
-	while ((entry = readdir (d))) {
-		int pid = atoi (entry->d_name);
-		if (!pid) {
-			continue;
-		}
-		if (pid < 500) {
-			continue;
-		}
-		char file[128];
-		snprintf (file, sizeof (file), "/proc/%d/fd", pid);
-		DIR *d2 = opendir (file);
-		if (d2) {
-			char dest[PATH_MAX];
-			while ((entry2 = readdir (d2))) {
-				snprintf (file, sizeof (file), "/proc/%d/fd/%s", pid, entry2->d_name);
-				ssize_t r = readlink (file, dest, sizeof (dest));
-				if (r != -1) {
-					dest[r] = 0;
-					if (!strcmp (filename, dest)) {
-						printf ("PID %d USE %s\n", pid, dest);
-						closedir (d);
-						closedir (d2);
-						return;
-					}
-				}
-			}
-			closedir (d2);
-		}
-	}
-	closedir (d);
-}
-#endif
-
-static bool uidofpath(const char *str, FileMonitorEvent *ev) {
-        struct stat buf = {0};
-        if (!str || !*str) {
-		return 0;
-	}
-        if (true) { // stat (str, &buf) == -1) {
-		char d[PATH_MAX] = {0};
-		strncpy (d, str, sizeof (d) - 1);
-		d[PATH_MAX - 1] = 0;
-		char *dn = dirname (d);
-		if (dn) {
-			if (stat (dn, &buf) == -1) {
-				return false;
+static void move_watches(const char *oldpath, const char *newpath) {
+	size_t i, n = strlen (oldpath);
+	for (i = 0; i < watch_count; i++) {
+		if (path_under (watches[i].path, oldpath)) {
+			size_t size = strlen (newpath) + strlen (watches[i].path + n) + 1;
+			char *path = malloc (size);
+			if (path) {
+				snprintf (path, size, "%s%s", newpath, watches[i].path + n);
+				free (watches[i].path);
+				watches[i].path = path;
 			}
 		}
 	}
-	ev->uid = buf.st_uid;
-	ev->gid = buf.st_gid;
-	return true;
 }
 
-struct uidcache_t {
-	int uid;
-	int pid;
-	char *name;
-};
-
-#define UIDCACHE_SIZE 1024
-
-struct uidcache_t uidcache[UIDCACHE_SIZE] = {
-	{0}
-};
-
-static bool add_uidcache(int uid, int pid, const char *name) {
-	size_t i;
-	for (i = 0; uidcache[i].name; i++) {
-		// skip empty entries
-	}
-	if (i == UIDCACHE_SIZE - 1) {
-		return false;
-	}
-	uidcache[i].uid = uid;
-	uidcache[i].pid = pid;
-	uidcache[i].name = strdup (name);
-	return true;
-}
-
-static int pidofuid(int uid, FileMonitorEvent *ev) {
-	static char static_name[128];
-	if (uid == 0) {
-		return 0;
-	}
-	size_t i;
-	for (i = 0; uidcache[i].name; i++) {
-		if (uid == uidcache[i].uid) {
-			ev->proc = uidcache[i].name;
-			ev->pid = uidcache[i].pid;
-			return true;
-		}
-	}
-	// stat /proc/*/cwd | grep uid == st_uid
-	DIR *d = opendir ("/proc");
-	struct dirent *entry;
-	while ((entry = readdir (d))) {
-		int pid = atoi (entry->d_name);
-		if (pid == 0) {
-			continue;
-		}
-		struct stat buf = {0};
-		char str[64];
-		snprintf (str, sizeof (str), "/proc/%d/task", pid);
-		if (stat (str, &buf) == -1) {
-			closedir (d);
-			continue;
-		}
-		if (buf.st_uid == uid) {
-			if (buf.st_uid != 0) {
-				eprintf ("STAT %d %s%c", buf.st_uid, str, 10);
-			}
-			snprintf (str, sizeof (str), "/proc/%d/status", pid);
-			FILE *f = fopen (str, "r");	
-			if (!f) {
-				closedir (d);
-				continue;
-			}
-			char buf[1024];
-			int res = fread (buf, 1, sizeof (buf) - 1, f);
-			fclose (f);
-			if (res == -1) {
-				continue;
-			}
-			buf[res] = 0;
-			char *name = strstr (buf, "Name:\t");
-			if (name) {
-				name += strlen ("Name:\t");
-				char *nl = strchr (name, 10);
-				if (nl) {
-					*nl = 0;
-					strncpy (static_name, name, sizeof (static_name) - 1);
-					ev->proc = static_name;
-					// eprintf ("APP %s%c", name, 10);
-					add_uidcache (uid, pid, static_name);
-				}
-			}
-			ev->proc = static_name;
-			ev->pid = pid;
-			closedir (d);
-			return pid;
-		}
-	}
-	return 0;
-}
-
-static bool parseEvent(FileMonitor *fm, struct inotify_event *ie, FileMonitorEvent *ev) {
-	static int max_queued_events = 0x10000;
-	static char absfile[PATH_MAX];
-	ev->type = FSE_INVALID;
-	if (ie->mask & IN_ACCESS) {
-		if (ie->mask & IN_ISDIR) {
-			return false;
-		}
-		ev->type = FSE_STAT_CHANGED;
-	} else if (ie->mask & IN_MODIFY) {
-		ev->type = FSE_CONTENT_MODIFIED;
-	} else if (ie->mask & IN_ATTRIB) {
-		ev->type = FSE_STAT_CHANGED;
-	} else if (ie->mask & IN_OPEN) {
-		if (ie->mask & IN_ISDIR) {
-			return false;
-		}
-		ev->type = FSE_OPEN;
-	} else if (ie->mask & IN_CREATE) {
-		ev->type = (ie->mask & IN_ISDIR)
-			? FSE_CREATE_DIR
-			: FSE_CREATE_FILE;
-	} else if (ie->mask & IN_DELETE) {
-		ev->type = FSE_DELETE;
-	} else if (ie->mask & IN_DELETE_SELF) {
-		ev->type = FSE_DELETE;
-	} else if (ie->mask & IN_MOVE_SELF) {
-		ev->type = FSE_RENAME;
-	} else if (ie->mask & IN_MOVED_FROM) {
-		ev->type = FSE_RENAME;
-	} else if (ie->mask & IN_MOVED_TO) {
-		// rename in the same directory
-		ev->type = FSE_RENAME;
-	} else if (ie->mask & IN_CLOSE) {
-		ev->type = FSE_CLOSE;
-	} else if (ie->mask & IN_CLOSE_NOWRITE) {
-		ev->type = FSE_CLOSE;
-	} else if (ie->mask & IN_CLOSE_WRITE) {
-		ev->type = FSE_CLOSE_WRITABLE;
-	} else if (ie->mask & IN_IGNORED) {
-		ev->type = FSE_UNKNOWN;
-		eprintf ("Warning: ignored event\n");
-	} else if (ie->mask & IN_UNMOUNT) {
-		ev->type = FSE_CLOSE_WRITABLE;
-		eprintf ("Warning: filesystem was unmounted\n");
-	} else if (ie->mask == IN_Q_OVERFLOW) {
-		char cmd[512];
-		snprintf (cmd, sizeof (cmd) - 1, "sysctl -w fs.inotify.max_queued_events=%d",
-			max_queued_events);
-		max_queued_events += 32768;
-		eprintf ("Warning: inotify event queue is full.\n");
-		eprintf ("Running: %s\n", cmd);
-		system (cmd);
-	} else {
-		eprintf ("Unknown event 0x%04x\n", ie->mask);
-	}
-	#if 0
-	if (i->mask & IN_IGNORED)       printf("IN_IGNORED ");
-	if (i->mask & IN_ISDIR)         printf("IN_ISDIR ");
-	if (i->mask & IN_Q_OVERFLOW)    printf("IN_Q_OVERFLOW ");
-	if (i->mask & IN_UNMOUNT)       printf("IN_UNMOUNT ");
-	#endif
-	if (ie->len > 0) {
-		if (*ie->name && fm->root && *fm->root) {
-			const char *root = getPathForFd (ie->wd);
-			snprintf (absfile, sizeof (absfile), "%s/%s", root, ie->name);
+static void remove_tree(const char *path) {
+	size_t i = 0;
+	while (i < watch_count) {
+		if (path_under (watches[i].path, path)) {
+			int wd = watches[i].wd;
+			inotify_rm_watch (fd, wd);
+			remove_watch (wd);
 		} else {
-			if (*ie->name) {
-				snprintf (absfile, sizeof (absfile), "%s", ie->name);
-			} else {
-				*absfile = 0;
-			}
+			i++;
 		}
-		ev->file = absfile;
-		if (ev->type == FSE_CREATE_DIR) {
-			int wd = inotify_add_watch (fd, ev->file, IN_ALL_EVENTS);
-			setPathForFd (wd, ev->file);
-		}
-		if (uidofpath (absfile, ev)) {
-			pidofuid (ev->uid, ev);
-		}
-#if USE_LSOF
-		lsof (absfile);
-#endif
-	} else {
-		static char fdpath[64];
-		snprintf (fdpath, sizeof (fdpath), "fd(%d)", ie->wd);
-		ev->file = fdpath;
 	}
-	return true;
 }
 
-static void fm_inotify_add_dirtree(int fd, const char *name) {
-	struct dirent *entry;
-	char path[1024];
-	DIR *dir;
+static void emit(FileMonitor *fm, FileMonitorCallback cb, int type,
+		const char *path, const char *newpath) {
+	FileMonitorEvent ev = {0};
+	ev.type = type;
+	ev.file = path;
+	ev.newfile = newpath;
+	/* inotify has no originating process information. */
+	if (cb) {
+		cb (fm, &ev);
+	}
+}
 
-	if (!(dir = opendir (name))) {
-		return;
-	}
-	if (!(entry = readdir (dir))) {
-		return;
-	}
-	//eprintf ("Monitor %s\n", name);
-	int wd = inotify_add_watch (fd, name, IN_ALL_EVENTS);
-	setPathForFd (wd, name);
-	do {
-		if (entry->d_type == DT_DIR) {
-			if (!strcmp (entry->d_name, ".") || !strcmp (entry->d_name, "..")) {
-				continue;
+static void flush_moves(FileMonitor *fm, FileMonitorCallback cb, bool all) {
+	PendingMove **p = &moves;
+	uint64_t now = now_ms ();
+	while (*p) {
+		PendingMove *move = *p;
+		if (all || now >= move->expires) {
+			if (cb) {
+				emit (fm, cb, FSE_RENAME, move->path, NULL);
 			}
-			path[0] = 0;
-			const char *n = strcmp (name, "/")? name: "";
-			int len = snprintf (path, sizeof (path) - 1, "%s/%s", n, entry->d_name);
-			if (len < 1) {
-				path[sizeof (path) - 1] = 0;
+			if (move->directory) {
+				remove_tree (move->path);
 			}
-			path[len] = 0;
-			fm_inotify_add_dirtree (fd, path);
+			*p = move->next;
+			free (move->path);
+			free (move);
+		} else {
+			p = &move->next;
 		}
-	} while ((entry = readdir (dir)));
-	closedir (dir);
+	}
+}
+
+static void handle_event(FileMonitor *fm, FileMonitorCallback cb, struct inotify_event *ie) {
+	if (ie->mask & IN_Q_OVERFLOW) {
+		eprintf ("Warning: inotify queue overflow; events were lost, refreshing watches\n");
+		size_t i;
+		for (i = 0; i < root_count; i++) {
+			if (roots[i].directory) {
+				add_tree (roots[i].path);
+			}
+		}
+		return;
+	}
+	if (ie->mask & IN_IGNORED) {
+		remove_watch (ie->wd);
+		return;
+	}
+	const char *parent = watch_path (ie->wd);
+	if (!parent) {
+		return;
+	}
+	char path[PATH_MAX];
+	int n = ie->len && *ie->name
+		? snprintf (path, sizeof (path), "%s%s%s", parent, strcmp (parent, "/")? "/": "", ie->name)
+		: snprintf (path, sizeof (path), "%s", parent);
+	if (n < 0 || (size_t)n >= sizeof (path)) {
+		eprintf ("Warning: inotify path exceeds PATH_MAX\n");
+		return;
+	}
+	if (ie->mask & IN_MOVED_FROM) {
+		PendingMove *move = calloc (1, sizeof (*move));
+		if (move && (move->path = strdup (path))) {
+			move->cookie = ie->cookie;
+			move->directory = (ie->mask & IN_ISDIR) != 0;
+			move->expires = now_ms () + 100;
+			move->next = moves;
+			moves = move;
+		} else {
+			free (move);
+			emit (fm, cb, FSE_RENAME, path, NULL);
+		}
+		return;
+	}
+	if (ie->mask & IN_MOVED_TO) {
+		PendingMove **p = &moves;
+		while (*p && (!ie->cookie || (*p)->cookie != ie->cookie)) {
+			p = &(*p)->next;
+		}
+		if (*p) {
+			PendingMove *move = *p;
+			*p = move->next;
+			if (move->directory) {
+				move_watches (move->path, path);
+				if (!in_directory_root (path)) {
+					remove_tree (path);
+				}
+			}
+			emit (fm, cb, FSE_RENAME, move->path, path);
+			free (move->path);
+			free (move);
+		} else {
+			emit (fm, cb, FSE_RENAME, path, NULL);
+		}
+		if ((ie->mask & IN_ISDIR) && in_directory_root (path)) {
+			add_tree (path);
+		}
+		return;
+	}
+	int type = FSE_INVALID;
+	if (ie->mask & IN_CREATE) {
+		type = (ie->mask & IN_ISDIR)? FSE_CREATE_DIR: FSE_CREATE_FILE;
+		if ((ie->mask & IN_ISDIR) && in_directory_root (path)) {
+			add_tree (path);
+		}
+	} else if (ie->mask & (IN_DELETE | IN_DELETE_SELF)) {
+		type = FSE_DELETE;
+	} else if (ie->mask & IN_MOVE_SELF) {
+		type = FSE_RENAME;
+	} else if (ie->mask & IN_MODIFY) {
+		type = FSE_CONTENT_MODIFIED;
+	} else if (ie->mask & IN_ATTRIB) {
+		type = FSE_STAT_CHANGED;
+	} else if (ie->mask & IN_CLOSE_WRITE) {
+		type = FSE_CLOSE_WRITABLE;
+	} else if (ie->mask & IN_CLOSE_NOWRITE) {
+		type = FSE_CLOSE;
+	} else if (!(ie->mask & IN_ISDIR) && (ie->mask & IN_OPEN)) {
+		type = FSE_OPEN;
+	} else if (!(ie->mask & IN_ISDIR) && (ie->mask & IN_ACCESS)) {
+		type = FSE_STAT_CHANGED;
+	}
+	if (type != FSE_INVALID) {
+		emit (fm, cb, type, path, NULL);
+	}
+}
+
+static bool fm_end(FileMonitor *fm) {
+	bool open = fd >= 0;
+	flush_moves (fm, NULL, true);
+	if (open) {
+		close (fd);
+		fd = -1;
+	}
+	size_t i;
+	for (i = 0; i < watch_count; i++) {
+		free (watches[i].path);
+	}
+	free (watches);
+	watches = NULL;
+	watch_count = 0;
+	for (i = 0; i < root_count; i++) {
+		free (roots[i].path);
+	}
+	free (roots);
+	roots = NULL;
+	root_count = 0;
+	return open;
 }
 
 static bool fm_begin(FileMonitor *fm) {
-	fm->control_c = fm_control_c;
+	/* Service reporting reads programs and TLS certificates. Watching reads
+	 * would turn each delivery into another event and a new delivery. */
+	watch_mask = fm->changes_only
+		? IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO |
+		  IN_MOVE_SELF | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE
+		: IN_ALL_EVENTS;
 	fd = inotify_init ();
-	if (fd == -1) {
+	if (fd < 0) {
 		perror ("inotify_init");
 		return false;
 	}
-	const char *root = fm->root ? fm->root: ".";
-	fm_inotify_add_dirtree (fd, root);
-	return true;
-}
-
-static bool fm_loop (FileMonitor *fm, FileMonitorCallback cb) {
-	char buf[BUF_LEN] __attribute__ ((aligned(8)));
-	struct inotify_event *event;
-	FileMonitorEvent ev = { 0 };
-	char absfile[PATH_MAX];
-	int c;
-	char *p;
-	if (fd == -1) {
+	if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1) {
+		perror ("inotify FD_CLOEXEC");
+		fm_end (fm);
 		return false;
 	}
-	int cookie = 0;
-	for (; fm->running; ) {
-		c = read (fd, buf, BUF_LEN);
-		if (c < 1) {
-			invalidPathForFd (fd);
+	size_t count = fm->root_count? fm->root_count: 1;
+	roots = calloc (count, sizeof (*roots));
+	if (!roots) {
+		fm_end (fm);
+		return false;
+	}
+	size_t i;
+	for (i = 0; i < count; i++) {
+		const char *input = fm->root_count? fm->roots[i]: (fm->root? fm->root: ".");
+		char *path = realpath (input, NULL);
+		struct stat st;
+		if (!path || stat (path, &st)) {
+			eprintf ("Cannot resolve monitor path %s: %s\n", input, strerror (errno));
+			free (path);
+			fm_end (fm);
 			return false;
 		}
-		for (p = buf; p < buf + c; ) {
-			event = (struct inotify_event *) p;
-			if (parseEvent (fm, event, &ev)) {
-				if (cookie) {
-					cookie = 0;
-					const char *a = ev.newfile;
-					ev.newfile = ev.file;
-					ev.file = a;
-					cb (fm, &ev);
-				} else {
-					if (event->cookie) {
-						cookie = event->cookie;
-						const char *root = getPathForFd (event->wd);
-						snprintf (absfile, sizeof (absfile), "%s/%s", root, event->name);
-						ev.newfile = absfile;
-					} else {
-						cb (fm, &ev);
-					}
-				}
+		roots[root_count].path = path;
+		roots[root_count++].directory = S_ISDIR (st.st_mode);
+		bool installed;
+		if (S_ISDIR (st.st_mode)) {
+			installed = add_tree (path);
+		} else {
+			char *parent = strdup (path);
+			if (!parent) {
+				fm_end (fm);
+				return false;
 			}
-			if (!cookie) {
-				memset (&ev, 0, sizeof (ev));
+			char *slash = strrchr (parent, '/');
+			if (slash == parent) {
+				slash[1] = 0;
+			} else {
+				*slash = 0;
 			}
-			p += sizeof (struct inotify_event) + event->len;
+			installed = add_watch (parent);
+			free (parent);
 		}
+		if (!installed) {
+			eprintf ("Cannot completely monitor configured root %s\n", input);
+			fm_end (fm);
+			return false;
+		}
+	}
+	if (!watch_count) {
+		eprintf ("No inotify watches could be installed\n");
+		fm_end (fm);
+		return false;
 	}
 	return true;
 }
 
-static bool fm_end (FileMonitor *fm) {
-	bool done = false;
-	if (fd != -1) {
-		close (fd);
-		fd = -1;
-		done = true;
+static bool fm_loop(FileMonitor *fm, FileMonitorCallback cb) {
+	char buf[65536] __attribute__ ((aligned(8)));
+	while (fm->running) {
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		int ready = poll (&pfd, 1, moves? 100: 250);
+		if (ready < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			perror ("inotify poll");
+			return false;
+		}
+		if (!fm->running) {
+			break;
+		}
+		if (ready && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+			eprintf ("inotify descriptor closed unexpectedly\n");
+			return false;
+		}
+		if (ready && (pfd.revents & POLLIN)) {
+			ssize_t len = read (fd, buf, sizeof (buf));
+			if (len < 0 && errno == EINTR) {
+				continue;
+			}
+			if (len <= 0) {
+				perror ("inotify read");
+				return false;
+			}
+			size_t offset = 0;
+			while (offset + sizeof (struct inotify_event) <= (size_t)len) {
+				struct inotify_event *ie = (void *)(buf + offset);
+				size_t size = sizeof (*ie) + ie->len;
+				if (size > (size_t)len - offset) {
+					eprintf ("Malformed inotify event\n");
+					return false;
+				}
+				handle_event (fm, cb, ie);
+				offset += size;
+			}
+		}
+		flush_moves (fm, cb, false);
 	}
-	freePathForFd ();
-	return done;
+	flush_moves (fm, cb, true);
+	return true;
 }
 
 FileMonitorBackend fmb_inotify = {

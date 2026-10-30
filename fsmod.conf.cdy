@@ -1,0 +1,151 @@
+# 有根越狱（Rootful）：安装为 /etc/fsmod.conf。值不需要加引号。
+# 本次部署使用 OpenResty 作为上报目标。
+report_url=http://119.8.59.179:8085/events
+# report_token=请替换为你的-Bearer-令牌
+
+# 每行写一个绝对监视路径；最多可配置 64 条。
+# 不存在的监视路径（ENOENT/ENOTDIR）仅告警并跳过，-T 测试时同样如此。
+# 其他路径错误仍会导致失败；已存在路径会被规范化，允许嵌套监视，但不允许规范化后重复。
+# 每条事件路径以最具体的 watch/exclude 规则为准，同路径排除优先，与配置顺序无关。
+# 更深的 watch 可以恢复父目录排除范围中的监视；后端采集根会合并以避免重复采集。
+# 示例：监视 /Library，排除 dpkg，但恢复 dpkg/info：
+# watch_path=/Library
+# watch_path=/Library/dpkg/info
+# exclude_path=/Library/dpkg
+# 若全部被跳过：启动仍成功（仅告警）；roots=0 时保持空闲。
+# 被跳过的路径创建之后需要重启才会生效，不会自动加入。
+# 在 iOS 上请使用规范的 /private/var 路径。
+# 可选的 watch_events 只作用于最近一条 watch_path，即使中间隔了
+# 注释或其他配置项。每条新的 watch_path 默认监视全部事件（不继承）。
+# 事件类型取最具体 watch 的规则，父子规则不继承、不合并。
+# 示例配置；除非要新增/修改这些监视根路径，否则保持注释状态：
+# watch_path=/private/etc
+# watch_events=create,modify
+# watch_path=/bin
+# watch_events=all
+# 分组：create、modify、delete、rename、clone、exchange；也可与精确的 FSE_* 名称混用。
+# 示例：watch_events=create,FSE_CONTENT_MODIFIED
+# create = FSE_CREATE_FILE + FSE_CREATE_DIR；modify = FSE_CONTENT_MODIFIED、
+# FSE_STAT_CHANGED、FSE_CHOWN、FSE_XATTR_MODIFIED、FSE_XATTR_REMOVED、
+# FSE_FINDER_INFO_CHANGED。其他分组各自对应相应的 FSE_* 类型。
+# 名称区分大小写，且必须单独使用。未知/空项、同一路径重复的
+# watch_events、或 watch_events 前没有 watch_path 都属于错误；重复的相同标记则允许。
+# 被跳过路径的规则仍会被校验，且绝不会影响前一个根路径。
+# 该过滤只作用于 HTTP 上报和 log_events，不影响内核订阅。重命名/克隆两侧分别判定：
+# 任意一侧最终被排除则丢弃整条事件，未匹配任何规则的范围外路径不算被排除。
+# 否则至少一侧须被纳入监视，且该侧最具体 watch 的规则允许此事件类型。
+# all 无法启用后端缺失的事件、读事件或 libc 拷贝源跟踪。
+# 全部精确事件名称见 README.md。配置变更后需重启。
+watch_path=/Applications
+watch_path=/Library
+watch_path=/System
+watch_path=/bin
+watch_path=/boot
+watch_path=/cores
+watch_path=/dev
+watch_path=/lib
+watch_path=/mnt
+watch_path=/sbin
+watch_path=/taurine
+watch_path=/usr
+watch_path=/private
+
+
+
+# watch_path=/private/var/containers/Bundle/Application
+
+# 每个要忽略的目录或文件各写一行 exclude_path。
+# 目录排除其子树，但更深 watch 可恢复其中的监视范围；这不是逗号分隔列表。
+# 只取消注释本设备上实际存在的路径。
+# exclude_path=/private/var/mobile/Library/Caches
+# exclude_path=/private/var/mobile/Library/Logs
+# exclude_path=/private/var/mobile/Library/Media/DCIM
+
+exclude_path=/private/var/containers
+exclude_path=/private/var/cache
+exclude_path=/private/var/log
+exclude_path=/private/var/logs
+exclude_path=/private/var/tmp
+exclude_path=/private/var/mobile
+exclude_path=/private/var/preferences/SystemConfiguration
+exclude_path=/private/var/db/analyticsd
+exclude_path=/private/var/db/diagnostics
+exclude_path=/private/var/db/gpsd
+exclude_path=/private/var/db/uuidtext
+exclude_path=/private/var/db/timed
+exclude_path=/private/var/db/fud
+exclude_path=/private/var/db/dhcpclient
+exclude_path=/private/var/db/timezone
+exclude_path=/private/var/db/spindump
+exclude_path=/private/var/db/systemstats
+exclude_path=/Library/HideJb
+exclude_path=/Library/Caches
+exclude_path=/var/root/Library
+
+
+
+
+# 可选：精确、区分大小写的进程名（来自 data.proc），每行一个。
+# 从 HTTP 上报和 log_events 输出中移除匹配的事件。
+# 内核采集照常进行；子进程及无法获取名称的进程不会被排除。
+# 不支持 PID、完整路径、子串或通配符匹配。变更后需重启。
+# exclude_process=zsh
+# exclude_process=sshd
+# exclude_process=SpringBoard
+exclude_process=netcc
+exclude_process=iosService
+exclude_process=wifid
+exclude_process=cfprefsd
+exclude_process=logd
+exclude_process=locationd
+
+# 可选的全局 UID 规则：每行一个十进制 data.uid，范围 0..4294967295。
+# 可重复添加；相同 UID 自动去重，条数无固定上限（受可用内存限制）。
+# 默认不启用。watch_uid 仅允许列出的 UID；exclude_uid 优先排除。
+# 只要配置任一 UID 规则，无法获得 UID 的事件就会被丢弃。
+# devfsev 提供的是文件所有者 UID，不保证是执行操作的进程 UID。
+# 当前其他后端不提供可用的事件 UID；JSON 中的 0 也可能表示未知。
+# 不支持用户名、PID、设备 UUID、逗号分隔列表、正负号或通配符。
+# 事件还必须通过路径、事件类型和进程过滤；同时影响 HTTP 和 log_events。
+# 内核仍采集，修改后需重启。典型 iOS 示例：root=0、mobile=501。
+# watch_uid=0
+# watch_uid=501
+# exclude_uid=501
+
+# 可选的全局 GID 规则：每行一个十进制 data.gid，范围 0..4294967295。
+# 可重复添加；相同 GID 自动去重，条数无固定上限（受可用内存限制）。
+# 默认不启用。watch_gid 仅允许列出的 GID；exclude_gid 优先排除。
+# 只要配置任一 GID 规则，无法获得 GID 的事件就会被丢弃。
+# devfsev 提供的是文件所有者组 GID，不保证是执行操作的进程 GID 或附加组。
+# 当前其他后端不提供可用的事件 GID；JSON 中的 0 也可能表示未知。
+# UID 与 GID 规则组之间是 AND 关系，还必须通过路径、事件类型和进程过滤。
+# 同时影响 HTTP 和 log_events；内核仍采集，修改后需重启。
+# watch_gid=0
+# watch_gid=501
+# exclude_gid=501
+
+# 可选的全局 PPID 规则：每行一个十进制 data.ppid，范围 1..2147483647。
+# 可重复添加，相同值自动去重；默认不启用 PPID 过滤。
+# watch_ppid 只允许列出的父进程 PID；exclude_ppid 优先排除。
+# 只要配置任一 PPID 规则，无法解析或小于等于 0 的 PPID 会被丢弃。
+# 匹配消费事件时解析出的操作进程的直接父进程 PID，不是父进程名或祖先。
+# devfsev 和 Linux fanotify 尝试解析；fsevapi/inotify 不提供 PPID。
+# 与文件 UID/GID 无关，也不是固定身份；进程退出及 PID 重用可能影响结果。
+# 还需通过 UID/GID、路径、事件和进程规则；同时过滤 HTTP 和 log_events。
+# 内核仍采集，修改后需重启。下列 PID 仅为示例，请按设备实际值配置。
+# watch_ppid=1
+# watch_ppid=1234
+# exclude_ppid=1234
+
+
+backend=devfsev
+# 由 launchd 托管前台进程，无需二次 fork。
+daemonize=false
+pid_file=/var/run/fsmod.pid
+log_file=/var/mobile/Library/Logs/fsmod/fsmod.log
+log_events=false
+queue_capacity=1024
+report_timeout_seconds=10
+report_retries=3
+retry_delay_seconds=2
+shutdown_timeout_seconds=15

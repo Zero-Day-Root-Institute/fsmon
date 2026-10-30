@@ -60,7 +60,12 @@ typedef struct kfs_event_arg {
 #define FSE_CHOWN                8
 #define FSE_XATTR_MODIFIED       9
 #define FSE_XATTR_REMOVED        10
-#define FSE_MAX_EVENTS           11
+#define FSE_LEGACY_MAX_EVENTS    11
+#define FSE_DOCID_CREATED        11
+#define FSE_DOCID_CHANGED        12
+#define FSE_UNMOUNT_PENDING      13
+#define FSE_CLONE                14
+#define FSE_MAX_EVENTS           15
 
 #define FSE_CLOSE 20
 #define FSE_CLOSE_WRITABLE 21
