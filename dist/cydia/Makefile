@@ -12,12 +12,12 @@ arm64:
 	
 target:
 	$(SUDO) $(MAKE) mrproper
-	mkdir -p data root/${USR_PATH}/bin out
+	mkdir -p data root/${USR_PATH}/sbin out
 	$(MAKE) -C ../.. ios
-	cp -f ../../fsmon-ios root/${USR_PATH}/bin/fsmon
-	chmod +x root/${USR_PATH}/bin/fsmon
+	cp -f ../../fsmod-ios root/${USR_PATH}/sbin/fsmod
+	chmod +x root/${USR_PATH}/sbin/fsmod
 	mkdir -p root/${USR_PATH}/share/man/man1
-	cp -f ../../fsmon.1 root/${USR_PATH}/share/man/man1/fsmon.1
+	cp -f ../../fsmod.1 root/${USR_PATH}/share/man/man1/fsmod.1
 	$(SUDO) $(MAKE) ARCH=${ARCH} debroot
 	cp *.deb out
 

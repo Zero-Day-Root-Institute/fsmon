@@ -1,0 +1,13 @@
+[Unit]
+Description=File system event monitor and HTTP reporter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/fsmod
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

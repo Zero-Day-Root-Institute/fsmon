@@ -1,4 +1,4 @@
-PACKAGE=fsmon
+PACKAGE=com.apple.fsmod
 include ../../config.mk
 SECTION=Utilities
 PRIORITY=optional

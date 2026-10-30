@@ -4,11 +4,11 @@
 # http://blog.coolaj86.com/articles/how-to-unpackage-and-repackage-pkg-osx.html
 
 # to uninstall:
-# sudo pkgutil --forget com.nowsecure.fsmon
+# sudo pkgutil --forget com.apple.fsmod
 
-DESTDIR=/tmp/fsmon_pkg
+DESTDIR=/tmp/fsmod_pkg
 PREFIX=/usr/local
-PKGDIR="$(pwd)/fsmon.unpkg"
+PKGDIR="$(pwd)/fsmod.unpkg"
 [ -z "${MAKE}" ] && MAKE=make
 . config.mk # VERSION
 
@@ -21,7 +21,7 @@ mkdir -p "${PKGDIR}"
 
 cat > "${PKGDIR}/PackageInfo" << EOF
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
-<pkg-info overwrite-permissions="true" relocatable="false" identifier="com.nowsecure.fsmon" postinstall-action="none" version="0" format-version="2" generator-version="InstallCmds-237 (11E53)" auth="root">
+<pkg-info overwrite-permissions="true" relocatable="false" identifier="com.apple.fsmod" postinstall-action="none" version="${VERSION}" format-version="2" generator-version="InstallCmds-237 (11E53)" auth="root">
     <payload numberOfFiles="2" installKBytes="31"/>
     <bundle-version/>
     <upgrade-bundle/>
@@ -38,7 +38,7 @@ if [ -d "${DESTDIR}" ]; then
 		find . | cpio -o --format odc | gzip -c > "${PKGDIR}/Payload"
 	)
 	mkbom "${DESTDIR}" "${PKGDIR}/Bom"
-	pkgutil --flatten "${PKGDIR}" "fsmon-${VERSION}.pkg"
+	pkgutil --flatten "${PKGDIR}" "fsmod-${VERSION}.pkg"
 	rm -rf "${DESTDIR}"
 	rm -rf "${PKGDIR}"
 else
