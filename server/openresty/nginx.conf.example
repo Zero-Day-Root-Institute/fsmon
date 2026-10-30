@@ -1,0 +1,15 @@
+# Include this fragment inside nginx.conf's http { ... } block.
+# Install redisUtil.lua and events.lua under /etc/fsmod/openresty/ first.
+lua_package_path "/etc/fsmod/openresty/?.lua;;";
+
+server {
+    listen 127.0.0.1:8080;
+    server_name localhost;
+
+    location = /events {
+        client_max_body_size 1m;
+        client_body_buffer_size 128k;
+        client_body_timeout 10s;
+        content_by_lua_file /etc/fsmod/openresty/events.lua;
+    }
+}
