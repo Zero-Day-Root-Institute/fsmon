@@ -1,4 +1,4 @@
-/* fsmon -- MIT - Copyright NowSecure 2016 - pancake@nowsecure.com  */
+/* fsmod -- MIT - Copyright NowSecure 2016 - pancake@nowsecure.com  */
 
 #if __APPLE__
 #include <stdio.h>
@@ -11,7 +11,7 @@
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <errno.h>
-#include "fsmon.h"
+#include "fsmod.h"
 
 #define PRIVATE
 #define __APPLE_PRIVATE

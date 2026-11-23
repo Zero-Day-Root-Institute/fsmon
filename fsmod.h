@@ -1,11 +1,12 @@
-#ifndef INCLUDE_FM_FSMON_H
-#define INCLUDE_FM_FSMON_H
+#ifndef INCLUDE_FM_FSMOD_H
+#define INCLUDE_FM_FSMOD_H
 
-#ifndef FSMON_VERSION
-#error FSMON_VERSION is not defined
+#ifndef FSMOD_VERSION
+#error FSMOD_VERSION is not defined
 #endif
 
 #include <stdint.h>
+#include <stddef.h>
 #include <signal.h>
 #include "backend/devfsev.h"
 #include "util.h"
@@ -21,13 +22,15 @@ struct filemonitor_event_t {
 	int ppid;
 	const char *proc;
 	const char *file;
-	const char *newfile; // renamed/moved
+	const char *newfile; // destination for rename, exchange, or clone
 	const char *event; // named event
-	int uid;
-	int gid;
+	uint32_t uid;
+	bool uid_available; /* Distinguish a real UID 0 from absent backend metadata. */
+	uint32_t gid;
+	bool gid_available; /* Independent of UID availability, including real GID 0. */
 	int type;
 	int mode;
-	uint32_t inode;
+	uint64_t inode;
 	uint64_t tstamp;
 	int dev_major;
 	int dev_minor;
@@ -44,6 +47,8 @@ struct filemonitor_backend_t {
 
 struct filemonitor_t {
 	const char *root;
+	const char **roots;
+	size_t root_count;
 	const char *proc;
 	const char *link;
 	int pid;
@@ -55,6 +60,7 @@ struct filemonitor_t {
 	volatile sig_atomic_t running;
 	bool fileonly;
 	bool show_timestamps;
+	bool changes_only; /* Daemon: do not report reads performed by HTTP delivery. */
 	uint64_t count;
 	void (*control_c)();
 	struct filemonitor_backend_t backend;

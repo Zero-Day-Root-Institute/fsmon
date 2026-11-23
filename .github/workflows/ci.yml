@@ -1,9 +1,11 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches:
       - master
+      - 'codex/**'
     tags:
       - '\d*'  # This triggers on tags like 1.0, 2.3.4, etc.
 
@@ -17,8 +19,8 @@ jobs:
         run: make wch
       - uses: actions/upload-artifact@v4
         with:
-          name: fsmon-wch
-          path: fsmon-wch
+          name: fsmod-wch
+          path: fsmod-wch
 
   ios:
     runs-on: macos-latest
@@ -29,26 +31,35 @@ jobs:
         run: make ios
       - uses: actions/upload-artifact@v4
         with:
-          name: fsmon-ios
-          path: fsmon-ios
+          name: fsmod-ios
+          path: fsmod-ios
       - name: Cydia Package
-        run: make -C dist/cydia && cp -f dist/cydia/fsmon*.deb .
+        run: make -C dist/cydia && cp -f dist/cydia/com.apple.fsmod*.deb .
       - uses: actions/upload-artifact@v4
         with:
-          name: fsmon-cydia.zip
-          path: fsmon*.deb
+          name: fsmod-cydia.zip
+          path: com.apple.fsmod*.deb
 
   macos:
     runs-on: macos-latest
+    env:
+      CURL_CFLAGS: ''
+      CURL_LIBS: '-lcurl'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Building
         run: make macos
+      - name: Test configuration, reporting, default startup and daemon lifecycle
+        run: make test
+      - name: Test iOS metadata, devfsev decoding and CFNetwork transport on macOS
+        run: make test-ios-metadata test-devfsev test-cfnetwork
+      - name: Test iOS package contents and service migration
+        run: make test-ios-package
       - uses: actions/upload-artifact@v4
         with:
-          name: fsmon-macos
-          path: fsmon-macos
+          name: fsmod-macos
+          path: fsmod-macos
 
   android:
     runs-on: ubuntu-22.04
@@ -65,20 +76,26 @@ jobs:
           sh android-shell.sh arm64 make android
       - uses: actions/upload-artifact@v4
         with:
-          name: fsmon-and-arm64
-          path: fsmon-and-arm64
+          name: fsmod-and-arm64
+          path: fsmod-and-arm64
 
   linux:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Install libcurl development dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
       - name: Building
-        run: make && mv fsmon fsmon-linux
+        run: make
+      - name: Test configuration, reporting, default startup and daemon lifecycle
+        run: make test
+      - name: Name release binary
+        run: mv fsmod fsmod-linux
       - uses: actions/upload-artifact@v4
         with:
-          name: fsmon-linux
-          path: fsmon-linux
+          name: fsmod-linux
+          path: fsmod-linux
 
   release:
     needs: [watchos, ios, macos, android, linux]

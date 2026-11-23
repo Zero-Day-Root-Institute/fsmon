@@ -1,4 +1,4 @@
-PACKAGE=fsmon
+PACKAGE=com.apple.fsmod
 ARCH=amd64
 DEPENDS=radare2
 SECTION=user/shell

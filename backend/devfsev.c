@@ -1,4 +1,4 @@
-/* fsmon -- MIT - Copyright NowSecure 2015-2016 - pancake@nowsecure.com  */
+/* fsmod -- MIT - Copyright NowSecure 2015-2016 - pancake@nowsecure.com  */
 
 #if __APPLE__
 #include <stdio.h>
@@ -11,95 +11,108 @@
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <errno.h>
-#include "fsmon.h"
-
-#define WIP 1
+#include <poll.h>
+#include "fsmod.h"
 
 #define FM_DEV "/dev/fsevents"
-#define FM_BUFSIZE 4096
+#define FM_BUFSIZE 65536
 
-#define R_MIN(x,y) (((x)>(y))?(y):(x))
-
-typedef struct __attribute__ ((__packed__)) {
-	uint16_t type;
-	uint16_t len;
-	union {
-		uint32_t u32;
-		uint64_t u64;
-		void *ptr;
-		uint16_t words[4];
-	} val;
-} FMEventStruct;
-
-static void fsevent_free (FileMonitorEvent *ev) {
-	memset (ev, 0, sizeof (FileMonitorEvent));
-	ev->type = -1;
+/* XNU copy_out_kfse()/fill_buff(): int32 type, int32 pid, then
+ * uint16 type + uint16 payload length + payload. DONE is only uint16.
+ * Return bytes consumed, zero for an incomplete record, or -1 for bad data.
+ * Pointers belong to the input buffer and are used only after DONE arrives. */
+static int parse_record(const uint8_t *buffer, size_t available, FileMonitorEvent *ev) {
+	int32_t type, pid;
+	size_t offset = 8;
+	memset(ev, 0, sizeof(*ev));
+	ev->type = FSE_INVALID;
+	if (available < offset) return 0;
+	memcpy(&type, buffer, sizeof(type));
+	memcpy(&pid, buffer + 4, sizeof(pid));
+	ev->type = type & FSE_TYPE_MASK;
+	ev->pid = pid;
+	for (;;) {
+		uint16_t arg_type, length;
+		if (available - offset < sizeof(arg_type)) return 0;
+		memcpy(&arg_type, buffer + offset, sizeof(arg_type));
+		if (arg_type == FSE_ARG_DONE) return (int)(offset + sizeof(arg_type));
+		if (available - offset < 4) return 0;
+		memcpy(&length, buffer + offset + 2, sizeof(length));
+		if (length > available - offset - 4) return 0;
+		const uint8_t *value = buffer + offset + 4;
+		bool source = ev->newfile == NULL;
+		uint32_t scalar;
+		switch (arg_type) {
+		case FSE_ARG_STRING:
+		case FSE_ARG_PATH:
+			if (!length || value[length - 1] != 0 ||
+				memchr(value, 0, length - 1)) return -1;
+			if (!ev->file) ev->file = (const char *)value;
+			else if (!ev->newfile && (ev->type == FSE_RENAME || ev->type == FSE_EXCHANGE ||
+				ev->type == FSE_CLONE))
+				ev->newfile = (const char *)value;
+			break;
+		case FSE_ARG_INT64:
+			if (length != sizeof(ev->tstamp)) return -1;
+			/* XNU appends mach_absolute_time() as its last INT64 argument. */
+			memcpy(&ev->tstamp, value, sizeof(ev->tstamp));
+			break;
+		case FSE_ARG_INO:
+			if (length == sizeof(uint64_t)) {
+				if (source) memcpy(&ev->inode, value, sizeof(ev->inode));
+			} else if (length == sizeof(uint32_t)) {
+				memcpy(&scalar, value, sizeof(scalar));
+				if (source) ev->inode = scalar;
+			} else return -1;
+			break;
+		case FSE_ARG_DEV:
+		case FSE_ARG_MODE:
+		case FSE_ARG_UID:
+		case FSE_ARG_GID:
+			if (length != sizeof(scalar)) return -1;
+			memcpy(&scalar, value, sizeof(scalar));
+			if (!source) break;
+			if (arg_type == FSE_ARG_DEV) {
+				ev->dev_major = major(scalar);
+				ev->dev_minor = minor(scalar);
+			} else if (arg_type == FSE_ARG_MODE) ev->mode = scalar;
+			else if (arg_type == FSE_ARG_UID) {
+				ev->uid = scalar;
+				ev->uid_available = true;
+			}
+			else {
+				ev->gid = scalar;
+				ev->gid_available = true;
+			}
+			break;
+		case FSE_ARG_FINFO:
+			/* XNU compact layout: ino64, dev32, mode32, uid32, gid32. */
+			if (length != 24) return -1;
+			if (!source) break;
+			memcpy(&ev->inode, value, sizeof(ev->inode));
+			memcpy(&scalar, value + 8, sizeof(scalar));
+			ev->dev_major = major(scalar);
+			ev->dev_minor = minor(scalar);
+			memcpy(&ev->mode, value + 12, sizeof(ev->mode));
+			memcpy(&ev->uid, value + 16, sizeof(ev->uid));
+			ev->uid_available = true;
+			memcpy(&ev->gid, value + 20, sizeof(ev->gid));
+			ev->gid_available = true;
+			break;
+		default:
+			/* Unknown extensions still have a length; preserve framing. */
+			break;
+		}
+		offset += 4 + length;
+	}
 }
 
-static int parse_event(FileMonitorEvent *ev, FMEventStruct *fme) {
-	int len = fme->val.words[3];
-	switch (fme->type) {
-	case 0:
-		break;
-	case FSE_ARG_RAW:
-	case FSE_ARG_VNODE:
-	case FSE_ARG_INT32:
-		/* not yet handled */
-		break;
-	case FSE_ARG_INT64: // This is a timestamp field on the FSEvent
-		// Event IDs are monotonically increasing per system, even
-		// across reboots and drives coming and going. They bear
-		// no relation to any particular clock or timebase.
-		ev->tstamp = fme->val.u64;
-		break;
-	case FSE_ARG_STRING: // This is a filename, for move/rename (Type 3)
-//		ev->newfile = (const char *)(fme) + 12;
-		break;
-	case FSE_ARG_DEV: // Block Device associated with the mounted fs
-		{
-			uint32_t val = fme->val.u32;
-			ev->dev_major = major (val);
-			ev->dev_minor = minor (val);
-		}
-		break;
-	case FSE_ARG_MODE:
-		ev->mode = fme->val.u32;
-		break;
-	case FSE_ARG_INO:
-		ev->inode = fme->val.u32;
-		break;
-	case FSE_ARG_UID:
-		ev->uid = fme->val.u32;
-		break;
-	case FSE_ARG_GID: // 0xb // 11 // This shuold be ARG_STRING or ARG_PATH
-		ev->gid = fme->val.u32;
-		if (ev->type == FSE_RENAME) {
-			ev->newfile = (const char *)(fme) + 12;
-			if (*ev->newfile != '/') {
-				ev->newfile = NULL;
-				ev->type = FSE_CREATE_FILE;
-			}
-		} else {
-			ev->newfile = NULL;
-		}
-		break;
-	case FSE_ARG_PATH:
-		//ev->newfile = (const char *)(fme) + 12;
-		break;
-	case FSE_ARG_FINFO:
-		// Not handling this yet.. Not really used, either..
-		break;
-	case FSE_ARG_DONE:
-		return -1;
-	case FSE_EVENTS_DROPPED: // 999 / 0x3e7
-		/* do nothing */
-		return 8;
-	default:
-		eprintf ("ERROR unknown type %d\n", fme->type);
-		/* ERROR */
-		return 0;
-	}
-	return len + sizeof (FMEventStruct);
+static void event_subscription(int8_t events[FSE_MAX_EVENTS]) {
+	memset(events, FSE_IGNORE, FSE_MAX_EVENTS);
+	memset(events, FSE_REPORT, FSE_LEGACY_MAX_EVENTS);
+	events[FSE_CLONE] = FSE_REPORT;
+	/* DOCID records have a separate layout. UNMOUNT_PENDING requires an ACK;
+	 * leave both ignored when extending the subscription to reach CLONE. */
 }
 
 static int fdsetup(int fd) {
@@ -107,10 +120,12 @@ static int fdsetup(int fd) {
 	int8_t events[FSE_MAX_EVENTS];
 	int rc, cloned_fd = -1;
 
-	memset (events, FSE_REPORT, FSE_MAX_EVENTS); // FSE_IGNORE
+	event_subscription(events);
 
 	clone_args.fd = &cloned_fd; // This is the descriptor we get back
-	clone_args.event_queue_depth = 10;
+	/* This is the kernel event queue, separate from the HTTP report queue.
+	 * Leave enough headroom for bursts while userspace processes a read. */
+	clone_args.event_queue_depth = 4096;
 	clone_args.event_list = events;
 	clone_args.num_events = FSE_MAX_EVENTS;
 
@@ -137,9 +152,19 @@ static bool fm_begin (FileMonitor *fm) {
 		perror ("open "FM_DEV);
 		return false;
 	}
+	if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1) {
+		perror ("fsevents FD_CLOEXEC");
+		close (fd);
+		return false;
+	}
 	fd = fdsetup (fd);
 	if (fd == -1) {
 		perror ("fdclone");
+		return false;
+	}
+	if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1) {
+		perror ("fsevents clone FD_CLOEXEC");
+		close (fd);
 		return false;
 	}
 	fm->fd = fd;
@@ -147,93 +172,61 @@ static bool fm_begin (FileMonitor *fm) {
 }
 
 static bool fm_loop (FileMonitor *fm, FileMonitorCallback cb) {
-	FileMonitorEvent ev = {0};
-	uint8_t buf[FM_BUFSIZE] = {0};
-	int arg_len, rc, buf_idx = 0, buf_end = -1;
-
-	if (sizeof (FMEventStruct) != 12) {
-		eprintf ("Invalid FMEventStruct, check your compiler\n");
-		return false;
-	}
-
+	uint8_t buf[FM_BUFSIZE];
+	size_t used = 0;
 	for (; fm->running; ) {
-		if (buf_idx == buf_end) {
-			buf_idx = 0;
-		} else if (buf_idx > 0) {
-			if (buf_idx > buf_end) {
-				eprintf ("Overflow detected and corrected (%d, %d)\n", buf_idx, buf_end);
-				buf_idx = 0;
-			} else {
-				memmove (buf, buf + buf_idx, (buf_end - buf_idx));
-				buf_idx = (buf_end - buf_idx);
-			}
-		}
-		if (buf_idx > FM_BUFSIZE) {
-			eprintf ("Warning: Some data is lost in fsevents data read (%d, %d)\n", buf_idx, FM_BUFSIZE);
-			buf_idx = 0;
-		}
-		memset (buf + buf_idx, 0x00, FM_BUFSIZE - buf_idx);
-		rc = read (fm->fd, buf + buf_idx, FM_BUFSIZE - buf_idx);
-		// hexdump (buf+buf_idx, rc, 0); //arg_len + 2, 0);
-		if (rc < 1) {
-			if (errno != EINTR) {
-				perror ("read");
-			}
+		struct pollfd pfd = { .fd = fm->fd, .events = POLLIN };
+		int ready = poll (&pfd, 1, 250);
+		if (ready < 0) {
+			if (errno == EINTR) continue;
+			perror ("fsevents poll");
 			return false;
 		}
-		buf_idx = 0;
-		buf_end = buf_idx + rc;
-
-		if (buf_end >= sizeof (buf))
-			buf_end = sizeof (buf);
-		while (buf_idx + 1 < buf_end) {
-			// hexdump (buf+buf_idx, sizeof (FMEventStruct) + 32, 0);
-			FMEventStruct *fme = (FMEventStruct*) (buf + buf_idx);
-			/* initialize on first set */
-			if (ev.type == -1) {
-				ev.type = fme->type;
-				ev.pid = fme->val.u32;
-				ev.ppid = 0;
-				ev.proc = get_proc_name (ev.pid, &ev.ppid);
-				ev.file = (const char *)buf + buf_idx + sizeof (FMEventStruct);
+		if (!fm->running) break;
+		if (!ready) continue;
+		if (!(pfd.revents & POLLIN)) {
+			eprintf ("fsevents descriptor closed unexpectedly\n");
+			return false;
+		}
+		/* XNU requires at least 2048 bytes of space on every device read. */
+		if (sizeof(buf) - used < 2048) {
+			eprintf("Oversized or incomplete fsevents record\n");
+			return false;
+		}
+		ssize_t rc = read (fm->fd, buf + used, sizeof(buf) - used);
+		if (rc < 1) {
+			if (rc < 0 && errno == EINTR) {
+				if (!fm->running) {
+					return true;
+				}
+				continue;
 			}
-			/* parse data packet */
-			arg_len = parse_event (&ev, fme);
-			if (arg_len == -1) {
-				if (ev.pid && ev.type != -1 && cb) {
-					cb (fm, &ev);
-				}
-				fsevent_free (&ev);
-				arg_len = 2;
-			} else if (arg_len < 1) {
-				arg_len = sizeof (FMEventStruct);
-			} else if (arg_len > (buf_end - buf_idx)) {
-#if WIP
-				int i;
-				bool found = false;
-				for (i = buf_idx + 1; i + sizeof (FMEventStruct) < buf_end; i++) {
-					if (!memcmp ("\x00\x00\xd4\x8f", buf +i, 4)) {
-						found = true;
-						break;
-					}
-				}
-				if (found) {
-					arg_len = i - buf_idx;
-					eprintf ("FCU %d\n", arg_len);
-				} else {
-					arg_len = sizeof (FMEventStruct) + 2;
-					eprintf ("Invalid length in fsevents data packet (%d, %d)\n",
-							arg_len, buf_end - buf_idx);
-					//arg_len += 12;
-					// hexdump (buf + buf_idx, buf_end - buf_idx, 0); //arg_len + 2, 0);
-				}
-#else
-				arg_len = sizeof (FMEventStruct) + 2;
-				eprintf ("Invalid length in fsevents data packet (%d, %d)\n",
-						arg_len, buf_end - buf_idx);
-#endif
+			perror ("read");
+			return false;
+		}
+		used += (size_t)rc;
+		size_t offset = 0;
+		while (fm->running && offset < used) {
+			FileMonitorEvent ev;
+			int consumed = parse_record(buf + offset, used - offset, &ev);
+			if (!consumed) break;
+			if (consumed < 0) {
+				eprintf("Malformed fsevents record\n");
+				return false;
 			}
-			buf_idx += arg_len;
+			if (ev.type == FSE_EVENTS_DROPPED) {
+				eprintf("fsmod: kernel fsevents queue dropped events\n");
+			} else if (ev.type < FSE_MAX_EVENTS && ev.pid && ev.file && ev.file[0] == '/' && cb) {
+				ev.proc = get_proc_name(ev.pid, &ev.ppid);
+				cb(fm, &ev);
+			}
+			offset += (size_t)consumed;
+		}
+		used -= offset;
+		if (used) memmove(buf, buf + offset, used);
+		if (used == sizeof(buf)) {
+			eprintf("fsevents record exceeds receive buffer\n");
+			return false;
 		}
 	}
 	return true;

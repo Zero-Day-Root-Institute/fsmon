@@ -1,4 +1,4 @@
-/* fsmon -- MIT - Copyright NowSecure 2016 - pancake@nowsecure.com  */
+/* fsmod -- MIT - Copyright NowSecure 2016 - pancake@nowsecure.com  */
 
 #if __linux__
 
@@ -11,10 +11,11 @@
 #include <unistd.h>
 #include <string.h>
 #include <dirent.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
-#include "fsmon.h"
+#include "fsmod.h"
 
 /* available on 2.6.37 and android-21 */
 /* kernel syscall */
@@ -52,7 +53,6 @@ static int fanotify_mark(int __fanotify_fd, unsigned int __flags,
 
 #if HAVE_FANOTIFY
 static volatile int fan_fd = -1;
-static fd_set rfds;
 #endif
 
 static void fm_control_c(void) {
@@ -77,14 +77,16 @@ static int handle_perm(int fan_fd, struct fanotify_event_metadata *metadata) {
 	return (ret < 0) ? ret : 0;
 }
 
-static bool parseFaEvent(FileMonitor *fm, struct fanotify_event_metadata *metadata, FileMonitorEvent *ev) {
-	char opath[PATH_MAX];
-
+static bool parseFaEvent(FileMonitor *fm, struct fanotify_event_metadata *metadata, FileMonitorEvent *ev, char *opath, size_t opath_size) {
 	if (metadata->fd >= 0) {
 		char path[PATH_MAX];
 		sprintf (path, "/proc/self/fd/%d", metadata->fd);
-		size_t path_len = readlink (path, opath, sizeof (opath) - 1);
-		if (path_len < 0) {
+		ssize_t path_len;
+		do {
+			path_len = readlink (path, opath, opath_size - 1);
+		} while (path_len < 0 && errno == EINTR && fm->running);
+		if (path_len < 0 || (size_t)path_len >= opath_size - 1) {
+			if (fm->running) eprintf ("Cannot resolve fanotify event path for fd %d\n", metadata->fd);
 			return false;
 		}
 		opath[path_len] = '\0';
@@ -105,10 +107,10 @@ static bool parseFaEvent(FileMonitor *fm, struct fanotify_event_metadata *metada
 	}
 	if (metadata->mask & FAN_CLOSE) {
 		if (metadata->mask & FAN_CLOSE_WRITE) {
-			ev->type = FSE_CREATE_FILE; // create
+			ev->type = FSE_CLOSE_WRITABLE;
 		}
 		if (metadata->mask & FAN_CLOSE_NOWRITE) {
-			ev->type = FSE_STAT_CHANGED; // close
+			ev->type = FSE_CLOSE;
 		}
 	}
 	if (metadata->mask & FAN_OPEN_PERM) {
@@ -126,61 +128,70 @@ static bool parseFaEvent(FileMonitor *fm, struct fanotify_event_metadata *metada
 }
 
 static bool fm_loop (FileMonitor *fm, FileMonitorCallback cb) {
-	FileMonitorEvent ev = {0};
-	char buf[4096];
-	ssize_t len;
-
-	if (fan_fd == -1) {
-		return false;
-	}
-
-	while (select (fan_fd + 1, &rfds, NULL, NULL, NULL) < 0) {
-		if (errno != EINTR || !fm->running) {
-			goto fail;
+	char buf[4096] __attribute__ ((aligned(8)));
+	while (fm->running && fan_fd >= 0) {
+		struct pollfd pfd = { .fd = fan_fd, .events = POLLIN };
+		int ready = poll (&pfd, 1, 250);
+		if (ready < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			perror ("fanotify poll");
+			return false;
 		}
-	}
-
-	while ((len = read (fan_fd, buf, sizeof (buf))) > 0) {
-		struct fanotify_event_metadata *metadata;
-		if (!fm->running || fan_fd == -1) {
+		if (!fm->running) {
 			break;
 		}
-		metadata = (void *)buf;
+		if (!ready) {
+			continue;
+		}
+		if (!(pfd.revents & POLLIN)) {
+			eprintf ("fanotify descriptor closed unexpectedly\n");
+			return false;
+		}
+		ssize_t len = read (fan_fd, buf, sizeof (buf));
+		if (len < 0 && errno == EINTR) {
+			continue;
+		}
+		if (len <= 0) {
+			perror ("fanotify read");
+			return false;
+		}
+		struct fanotify_event_metadata *metadata = (void *)buf;
+		bool valid = true;
 		while (FAN_EVENT_OK (metadata, len)) {
-			if (metadata->vers < 2) {
-				eprintf ("Kernel fanotify version too old\n");
-				goto fail;
+			FileMonitorEvent ev = { .type = FSE_INVALID };
+			char path[PATH_MAX];
+			if (metadata->vers != FANOTIFY_METADATA_VERSION) {
+				eprintf ("Unsupported fanotify metadata version\n");
+				valid = false;
+			} else if (metadata->mask & FAN_Q_OVERFLOW) {
+				eprintf ("Warning: fanotify queue overflow; events were lost\n");
+			} else if (valid && parseFaEvent (fm, metadata, &ev, path, sizeof (path))) {
+				if (ev.type != FSE_INVALID && cb) {
+					cb (fm, &ev);
+				}
 			}
-			if (!parseFaEvent (fm, metadata, &ev)) {
-				goto fail;
-			}
-			if (ev.type != -1) {
-				cb (fm, &ev);
-			}
-			memset (&ev, 0, sizeof (ev));
-			if (metadata->fd >= 0 && close (metadata->fd) != 0) {
-				goto fail;
+			if (metadata->fd >= 0) {
+				close (metadata->fd);
 			}
 			metadata = FAN_EVENT_NEXT (metadata, len);
 		}
-		while (select (fan_fd + 1, &rfds, NULL, NULL, NULL) < 0) {
-			if (errno != EINTR || !fm->running) {
-				goto fail;
-			}
+		if (!valid) {
+			return false;
 		}
 	}
-	if (len < 0) {
-		goto fail;
-	}
 	return true;
-fail:
-	perror ("fanotify_loop");
-	return false;
 }
 
 static bool fm_begin(FileMonitor *fm) {
-	uint64_t fan_mask = FAN_OPEN | FAN_CLOSE | FAN_ACCESS | FAN_MODIFY;
-	unsigned int mark_flags = FAN_MARK_ADD, init_flags = 0;
+	/* A reporter opens executables/certificates for every delivery. Services
+	 * subscribe only to mutations to avoid reporting their own read traffic.
+	 * Keep the mount API compatible: do not add FAN_CREATE/FAN_DELETE. */
+	uint64_t fan_mask = fm->changes_only
+		? FAN_MODIFY | FAN_CLOSE_WRITE
+		: FAN_OPEN | FAN_CLOSE | FAN_ACCESS | FAN_MODIFY;
+	unsigned int mark_flags = FAN_MARK_ADD, init_flags = FAN_CLOEXEC;
 	struct sigaction sa;
 
 	fm->control_c = fm_control_c;
@@ -198,20 +209,21 @@ static bool fm_begin(FileMonitor *fm) {
 	init_flags |= (fan_mask & FAN_ALL_PERM_EVENTS)
 		? FAN_CLASS_CONTENT
 		: FAN_CLASS_NOTIF;
-	if (!fm->root) {
-		fm->root = "/";
-	}
-	fan_fd = fanotify_init (init_flags, O_RDONLY); // | O_LARGEFILE);
+	fan_fd = fanotify_init (init_flags, O_RDONLY | O_CLOEXEC);
 	if (fan_fd < 0) {
 		perror ("fanotify_init");
 		return false;
 	}
-	if (fanotify_mark (fan_fd, mark_flags, fan_mask, AT_FDCWD, fm->root) != 0) {
-		perror ("fanotify_mark");
-		return false;
+	size_t i, count = fm->root_count? fm->root_count: 1;
+	for (i = 0; i < count; i++) {
+		const char *root = fm->root_count? fm->roots[i]: (fm->root? fm->root: "/");
+		if (fanotify_mark (fan_fd, mark_flags, fan_mask, AT_FDCWD, root) != 0) {
+			eprintf ("Cannot mark fanotify root %s: %s\n", root, strerror (errno));
+			close (fan_fd);
+			fan_fd = -1;
+			return false;
+		}
 	}
-	FD_ZERO (&rfds);
-	FD_SET (fan_fd, &rfds);
 	return true;
 }
 

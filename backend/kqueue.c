@@ -1,4 +1,4 @@
-/* fsmon -- MIT - Copyright NowSecure 2016 - pancake@nowsecure.com  */
+/* fsmod -- MIT - Copyright NowSecure 2016 - pancake@nowsecure.com  */
 
 #if __APPLE__
 #include <stdio.h>
@@ -9,24 +9,40 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
+#include <sys/event.h>
 #include <sys/sysctl.h>
 #include <errno.h>
-#include "fsmon.h"
+#include "fsmod.h"
 
 #define KQUEUE_DEBUG 1
+
+static int watched_dirfd = -1;
 
 static bool fm_begin (FileMonitor *fm) {
 	struct kevent direvent;
 	int kq = kqueue ();
-	int dirfd = open (fm->root, O_RDONLY);
 	if (kq == -1) {
+		return false;
+	}
+	if (fcntl (kq, F_SETFD, FD_CLOEXEC) == -1) {
+		close (kq);
+		return false;
+	}
+	int dirfd = open (fm->root? fm->root: ".", O_RDONLY);
+	if (dirfd == -1 || fcntl (dirfd, F_SETFD, FD_CLOEXEC) == -1) {
+		if (dirfd >= 0) close (dirfd);
+		close (kq);
 		return false;
 	}
 
 	EV_SET (&direvent, dirfd, EVFILT_VNODE, EV_ADD | EV_CLEAR | EV_ENABLE,
 			NOTE_WRITE, 0, (void *)fm->root);
 
-	kevent (kq, &direvent, 1, NULL, 0, NULL);
+	if (kevent (kq, &direvent, 1, NULL, 0, NULL) == -1) {
+		close (dirfd);
+		close (kq);
+		return false;
+	}
 #if 0
 	// Register interest in SIGINT with the queue.  The user data
 	// is NULL, which is how we'll differentiate between
@@ -41,6 +57,7 @@ static bool fm_begin (FileMonitor *fm) {
 	kevent (kq, &sigevent, 1, NULL, 0, NULL);
 #endif
 	fm->fd = kq;
+	watched_dirfd = dirfd;
 	return true;
 }
 
@@ -92,6 +109,10 @@ static bool fm_loop (FileMonitor *fm, FileMonitorCallback cb) {
 }
 
 static bool fm_end(FileMonitor *fm) {
+	if (watched_dirfd != -1) {
+		close (watched_dirfd);
+		watched_dirfd = -1;
+	}
 	if (fm && fm->fd != -1) {
 		close (fm->fd);
 		fm->fd = -1;
